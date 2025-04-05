@@ -1,23 +1,26 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
-use sonarr::{
+use anyhow::{Result, anyhow};
+use radarr::{
     apis::{
+        Api, ApiClient,
         configuration::{ApiKey, Configuration},
         queue_api::{ApiV3QueueBulkDeleteParams, ApiV3QueueGetParams},
-        Api as _, ApiClient,
     },
-    models::{QueueBulkResource, QueueResourcePagingResource},
+    models::{
+        RadarrHealthCheckResult, RadarrQueueBulkResource, RadarrQueueResource,
+        RadarrQueueResourcePagingResource, RadarrSystemResource,
+    },
 };
 
-use crate::config::SonarrConfig;
+use crate::config::RadarrConfig;
 
-pub struct SonarrAPI {
+pub struct RadarrAPI {
     api: ApiClient,
 }
 
-impl SonarrAPI {
-    pub fn new(app_config: &SonarrConfig) -> Result<Self> {
+impl RadarrAPI {
+    pub fn new(app_config: &RadarrConfig) -> Result<Self> {
         let mut config = Configuration::default();
         config.base_path = app_config
             .host
@@ -28,13 +31,29 @@ impl SonarrAPI {
             prefix: None,
             key: app_config.api_key.to_string(),
         });
-
-        Ok(SonarrAPI {
+        Ok(RadarrAPI {
             api: ApiClient::new(Arc::new(config)),
         })
     }
 
-    pub async fn get_queue(&self) -> Result<QueueResourcePagingResource> {
+    pub async fn get_system_status(&self) -> Result<RadarrSystemResource> {
+        self.api
+            .system_api()
+            .api_v3_system_status_get()
+            .await
+            .map_err(|e| anyhow!("Could not retrieve system status: {e}"))
+    }
+
+    pub async fn get_queue(&self) -> Result<Vec<RadarrQueueResource>> {
+        for health_resource in self.api.health_api().api_v3_health_get().await? {
+            if health_resource.r#type == Some(RadarrHealthCheckResult::Error)
+                && health_resource
+                    .source
+                    .is_some_and(|v| v.is_some_and(|s| s == "DownloadClientCheck"))
+            {
+                return Err(anyhow!("Health check failed for download client"));
+            }
+        }
         let total_records = self
             .api
             .queue_api()
@@ -50,7 +69,10 @@ impl SonarrAPI {
                     .page_size(total_records)
                     .build(),
             )
-            .await?)
+            .await?
+            .records
+            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     pub async fn queue_id_delete_bulk(
@@ -66,7 +88,7 @@ impl SonarrAPI {
             blocklist,
             skip_redownload,
             change_category,
-            queue_bulk_resource: Some(QueueBulkResource {
+            radarr_queue_bulk_resource: Some(RadarrQueueBulkResource {
                 ids: Some(Some(ids)),
             }),
         };

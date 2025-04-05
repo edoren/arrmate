@@ -1,23 +1,26 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use radarr::{
+use sonarr::{
     apis::{
-        Api, ApiClient,
+        Api as _, ApiClient,
         configuration::{ApiKey, Configuration},
-        queue_api::{ApiV3QueueBulkDeleteParams, ApiV3QueueGetParams, QueueApi, QueueApiClient},
+        queue_api::{ApiV3QueueBulkDeleteParams, ApiV3QueueGetParams},
     },
-    models::{QueueBulkResource, QueueResourcePagingResource},
+    models::{
+        SonarrHealthCheckResult, SonarrQueueBulkResource, SonarrQueueResource,
+        SonarrQueueResourcePagingResource, SonarrSystemResource,
+    },
 };
 
-use crate::config::RadarrConfig;
+use crate::config::SonarrConfig;
 
-pub struct RadarrAPI {
+pub struct SonarrAPI {
     api: ApiClient,
 }
 
-impl RadarrAPI {
-    pub fn new(app_config: &RadarrConfig) -> Result<Self> {
+impl SonarrAPI {
+    pub fn new(app_config: &SonarrConfig) -> Result<Self> {
         let mut config = Configuration::default();
         config.base_path = app_config
             .host
@@ -28,12 +31,30 @@ impl RadarrAPI {
             prefix: None,
             key: app_config.api_key.to_string(),
         });
-        Ok(RadarrAPI {
+
+        Ok(SonarrAPI {
             api: ApiClient::new(Arc::new(config)),
         })
     }
 
-    pub async fn get_queue(&self) -> Result<QueueResourcePagingResource> {
+    pub async fn get_system_status(&self) -> Result<SonarrSystemResource> {
+        self.api
+            .system_api()
+            .api_v3_system_status_get()
+            .await
+            .map_err(|e| anyhow!("Could not retrieve system status: {e}"))
+    }
+
+    pub async fn get_queue(&self) -> Result<Vec<SonarrQueueResource>> {
+        for health_resource in self.api.health_api().api_v3_health_get().await? {
+            if health_resource.r#type == Some(SonarrHealthCheckResult::Error)
+                && health_resource
+                    .source
+                    .is_some_and(|v| v.is_some_and(|s| s == "DownloadClientCheck"))
+            {
+                return Err(anyhow!("Health check failed for download client"));
+            }
+        }
         let total_records = self
             .api
             .queue_api()
@@ -49,7 +70,10 @@ impl RadarrAPI {
                     .page_size(total_records)
                     .build(),
             )
-            .await?)
+            .await?
+            .records
+            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     pub async fn queue_id_delete_bulk(
@@ -65,7 +89,7 @@ impl RadarrAPI {
             blocklist,
             skip_redownload,
             change_category,
-            queue_bulk_resource: Some(QueueBulkResource {
+            sonarr_queue_bulk_resource: Some(SonarrQueueBulkResource {
                 ids: Some(Some(ids)),
             }),
         };

@@ -297,6 +297,7 @@ dependencies = [
 [[package]]
 name = "edolib"
 version = "0.1.0"
+source = "git+https://github.com/edoren/edolib-rs.git#cfa51578fec81a4a14191ddebcfe2b1db149bd24"
 dependencies = [
  "dirs",
  "thiserror 2.0.12",
