@@ -33,6 +33,11 @@ impl StrikeData {
     }
 }
 
+const BANNED_MESSAGES: [&str; 2] = [
+    "Found potentially dangerous file",
+    "Invalid video file, unsupported extension",
+];
+
 const MAX_NUM_STRIKES: usize = 5;
 const STALLED_INTERVAL: Duration = Duration::from_secs(60 * 5);
 
@@ -89,11 +94,14 @@ impl RetryController {
                     })
                 {
                     let current_sizeleft = resource.sizeleft.unwrap_or(f64::MAX) as i64;
-                    let strike = self.strikes.entry(download_id.clone()).or_insert(StrikeData::new(
-                        0,
-                        resource.sizeleft.unwrap_or(f64::MAX) as i64,
-                        current_time - STALLED_INTERVAL,
-                    ));
+                    let strike =
+                        self.strikes
+                            .entry(download_id.clone())
+                            .or_insert(StrikeData::new(
+                                0,
+                                resource.sizeleft.unwrap_or(f64::MAX) as i64,
+                                current_time - STALLED_INTERVAL,
+                            ));
 
                     // TODO: add threshold for size difference
                     if current_time >= strike.last_check + STALLED_INTERVAL
@@ -157,7 +165,11 @@ impl RetryController {
                             .unwrap_or_default()
                             .unwrap_or_default()
                             .iter()
-                            .any(|msg| msg.contains("Found potentially dangerous file"))
+                            .any(|msg| {
+                                BANNED_MESSAGES
+                                    .iter()
+                                    .any(|banned_msg| msg.contains(banned_msg))
+                            })
                         {
                             add_to_remove = true;
                             add_to_blocklist = true;
@@ -181,38 +193,46 @@ impl RetryController {
                 .iter()
                 .filter_map(|res| res.title.as_ref().and_then(|inner| inner.as_ref()))
                 .collect();
-            info!("Following queue removed: {removed:?}");
-            self.sonarr_api
-                .queue_id_delete_bulk(
-                    sonarr_ids_to_remove
-                        .into_iter()
-                        .filter_map(|res| res.id)
-                        .collect(),
-                    Some(true),
-                    Some(false),
-                    Some(false),
-                    Some(false),
-                )
-                .await?;
+            if self.retry_config.dry_run.unwrap_or(false) {
+                info!("Dry run enabled, not removing: {removed:?}");
+            } else {
+                info!("Following queue removed: {removed:?}");
+                self.sonarr_api
+                    .queue_id_delete_bulk(
+                        sonarr_ids_to_remove
+                            .into_iter()
+                            .filter_map(|res| res.id)
+                            .collect(),
+                        Some(true),
+                        Some(false),
+                        Some(false),
+                        Some(false),
+                    )
+                    .await?;
+            }
         }
         if !sonarr_ids_to_remove_and_blocklist.is_empty() {
             let removed: Vec<&String> = sonarr_ids_to_remove_and_blocklist
                 .iter()
                 .filter_map(|res| res.title.as_ref().and_then(|inner| inner.as_ref()))
                 .collect();
-            info!("Following queue removed and blocked: {removed:?}");
-            self.sonarr_api
-                .queue_id_delete_bulk(
-                    sonarr_ids_to_remove_and_blocklist
-                        .into_iter()
-                        .filter_map(|res| res.id)
-                        .collect(),
-                    Some(true),
-                    Some(true),
-                    Some(false),
-                    Some(false),
-                )
-                .await?;
+            if self.retry_config.dry_run.unwrap_or(false) {
+                info!("Dry run enabled, not removing and blocking: {removed:?}");
+            } else {
+                info!("Following queue removed and blocked: {removed:?}");
+                self.sonarr_api
+                    .queue_id_delete_bulk(
+                        sonarr_ids_to_remove_and_blocklist
+                            .into_iter()
+                            .filter_map(|res| res.id)
+                            .collect(),
+                        Some(true),
+                        Some(true),
+                        Some(false),
+                        Some(false),
+                    )
+                    .await?;
+            }
         }
 
         for resource in radarr_queue_items {
@@ -305,7 +325,11 @@ impl RetryController {
                             .unwrap_or_default()
                             .unwrap_or_default()
                             .iter()
-                            .any(|msg| msg.contains("Found potentially dangerous file"))
+                            .any(|msg| {
+                                BANNED_MESSAGES
+                                    .iter()
+                                    .any(|banned_msg| msg.contains(banned_msg))
+                            })
                         {
                             add_to_remove = true;
                             add_to_blocklist = true;
@@ -341,38 +365,46 @@ impl RetryController {
                 .iter()
                 .filter_map(|res| res.title.as_ref().and_then(|inner| inner.as_ref()))
                 .collect();
-            info!("Following queue removed: {removed:?}");
-            self.radarr_api
-                .queue_id_delete_bulk(
-                    radarr_ids_to_remove
-                        .into_iter()
-                        .filter_map(|res| res.id)
-                        .collect(),
-                    Some(true),
-                    Some(false),
-                    Some(false),
-                    Some(false),
-                )
-                .await?;
+            if self.retry_config.dry_run.unwrap_or(false) {
+                info!("Dry run enabled, not removing: {removed:?}");
+            } else {
+                info!("Following queue removed: {removed:?}");
+                self.radarr_api
+                    .queue_id_delete_bulk(
+                        radarr_ids_to_remove
+                            .into_iter()
+                            .filter_map(|res| res.id)
+                            .collect(),
+                        Some(true),
+                        Some(false),
+                        Some(false),
+                        Some(false),
+                    )
+                    .await?;
+            }
         }
         if !radarr_ids_to_remove_and_blocklist.is_empty() {
             let removed: Vec<&String> = radarr_ids_to_remove_and_blocklist
                 .iter()
                 .filter_map(|res| res.title.as_ref().and_then(|inner| inner.as_ref()))
                 .collect();
-            info!("Following queue removed and blocked: {removed:?}");
-            self.radarr_api
-                .queue_id_delete_bulk(
-                    radarr_ids_to_remove_and_blocklist
-                        .into_iter()
-                        .filter_map(|res| res.id)
-                        .collect(),
-                    Some(true),
-                    Some(true),
-                    Some(false),
-                    Some(false),
-                )
-                .await?;
+            if self.retry_config.dry_run.unwrap_or(false) {
+                info!("Dry run enabled, not removing and blocking: {removed:?}");
+            } else {
+                info!("Following queue removed and blocked: {removed:?}");
+                self.radarr_api
+                    .queue_id_delete_bulk(
+                        radarr_ids_to_remove_and_blocklist
+                            .into_iter()
+                            .filter_map(|res| res.id)
+                            .collect(),
+                        Some(true),
+                        Some(true),
+                        Some(false),
+                        Some(false),
+                    )
+                    .await?;
+            }
         }
 
         Ok(())

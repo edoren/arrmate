@@ -3,10 +3,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use log::{error, info, warn};
 use tasks::{cleanup::CleanupController, retry::RetryController};
-use tokio::{
-    fs,
-    time::{Instant, sleep},
-};
+use tokio::fs;
 
 mod apis;
 mod config;
@@ -28,8 +25,10 @@ async fn run() -> Result<()> {
 
     let mut cleanup_controller = {
         let config = config.clone();
+        let mut cleanup_config = config.cleanup;
+        cleanup_config.dry_run = config.dry_run.or(cleanup_config.dry_run);
         CleanupController::new(
-            config.cleanup,
+            cleanup_config,
             config.qbittorrent,
             config.sonarr,
             config.radarr,
@@ -38,12 +37,14 @@ async fn run() -> Result<()> {
     };
 
     let mut retry_controller = if let ConfigData {
-        retry: Some(retry_config),
+        retry: Some(mut retry_config),
         sonarr: Some(sonarr_config),
         radarr: Some(radarr_config),
+        dry_run: main_dry_run,
         ..
     } = config
     {
+        retry_config.dry_run = main_dry_run.or(retry_config.dry_run);
         RetryController::new(retry_config, &sonarr_config, &radarr_config).ok()
     } else {
         None

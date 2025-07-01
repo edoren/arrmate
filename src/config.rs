@@ -24,6 +24,7 @@ pub struct RadarrConfig {
 #[derive(Clone, Deserialize, Debug)]
 pub struct CleanupIgnoredTrackersConfig {
     pub trackers: Option<Vec<String>>,
+    pub categories: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,11 +87,13 @@ pub struct CleanupConfig {
     #[serde(deserialize_with = "deserialize_ratio")]
     pub ratio: Option<RatioConfig>,
     pub ignored: Option<CleanupIgnoredTrackersConfig>,
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct RetryConfig {
     pub timeout: u64,
+    pub dry_run: Option<bool>,
 }
 
 fn deserialize_refresh_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -119,4 +122,5 @@ pub struct ConfigData {
     pub qbittorrent: QBittorrentConfig,
     pub sonarr: Option<SonarrConfig>,
     pub radarr: Option<RadarrConfig>,
+    pub dry_run: Option<bool>,
 }

@@ -1,8 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, fmt::Debug, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use log::{info, trace};
+use log::{debug, info, trace};
 use qbit_rs::{
     Qbit,
     model::{Credential, GetTorrentListArg, Torrent},
@@ -19,7 +19,14 @@ use crate::{
 
 #[async_trait]
 trait TorrentFilter {
+    fn name(&self) -> String;
     async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>>;
+}
+
+impl Debug for dyn TorrentFilter {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.name())
+    }
 }
 
 struct RatioFilter {
@@ -34,6 +41,10 @@ impl RatioFilter {
 
 #[async_trait]
 impl TorrentFilter for RatioFilter {
+    fn name(&self) -> String {
+        "RatioFilter".to_string()
+    }
+
     async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
         let ratio = match self.ratio.as_ref() {
             Some(val) => val,
@@ -71,6 +82,10 @@ impl TrackerFilter {
 
 #[async_trait]
 impl TorrentFilter for TrackerFilter {
+    fn name(&self) -> String {
+        "TrackerFilter".to_string()
+    }
+
     async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
         let ignored_trackers = match self.ignored_trackers.as_ref() {
             Some(ignored_trackers) => ignored_trackers,
@@ -103,6 +118,43 @@ impl TorrentFilter for TrackerFilter {
     }
 }
 
+struct CategoriesFilter {
+    ignored_categories: Option<Vec<String>>,
+}
+
+impl CategoriesFilter {
+    fn new(ignored_categories: Option<Vec<String>>) -> Self {
+        Self { ignored_categories }
+    }
+}
+
+#[async_trait]
+impl TorrentFilter for CategoriesFilter {
+    fn name(&self) -> String {
+        "CategoriesFilter".to_string()
+    }
+
+    async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
+        let ignored_categories = match self.ignored_categories.as_ref() {
+            Some(ignored_categories) => ignored_categories,
+            None => return Ok(torrents),
+        };
+
+        let mut result = vec![];
+        for torrent in torrents {
+            let ignored = torrent
+                .category
+                .as_ref()
+                .is_some_and(|category| ignored_categories.contains(category));
+
+            if !ignored {
+                result.push(torrent);
+            }
+        }
+        Ok(result)
+    }
+}
+
 struct SonarrFilter {
     sonarr_api: Arc<Option<SonarrAPI>>,
 }
@@ -115,6 +167,10 @@ impl SonarrFilter {
 
 #[async_trait]
 impl TorrentFilter for SonarrFilter {
+    fn name(&self) -> String {
+        "SonarrFilter".to_string()
+    }
+
     async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
         let api = match self.sonarr_api.as_ref() {
             Some(api) => api,
@@ -139,17 +195,27 @@ impl TorrentFilter for SonarrFilter {
             }
         }
 
+        let queue_download_ids = queue_items
+            .into_iter()
+            .filter_map(|item| item.download_id.and_then(|id| id))
+            .map(|id| id.to_lowercase())
+            .collect::<HashSet<String>>();
+
+        trace!(
+            "torrents: {:?}",
+            torrents
+                .iter()
+                .filter_map(|t| t.name.clone())
+                .collect::<Vec<String>>()
+        );
+
+        trace!("Sonarr Download Ids: {:?}", queue_download_ids);
+
         let mut torrents = torrents;
         torrents.retain(|torrent| {
             if let Some(hash) = &torrent.hash {
-                for queue_item in &queue_items {
-                    let download_id = queue_item
-                        .download_id
-                        .clone()
-                        .unwrap_or_default()
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    if download_id == hash.to_lowercase() {
+                for download_id in &queue_download_ids {
+                    if download_id == &hash.to_lowercase() {
                         return false;
                     }
                 }
@@ -173,6 +239,10 @@ impl RadarrFilter {
 
 #[async_trait]
 impl TorrentFilter for RadarrFilter {
+    fn name(&self) -> String {
+        "RadarrFilter".to_string()
+    }
+
     async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
         let api = match self.radarr_api.as_ref() {
             Some(api) => api,
@@ -259,11 +329,19 @@ impl CleanupController {
             self.qbit_api.clone(),
             self.cleanup_config.ignored.clone().and_then(|i| i.trackers),
         )));
+        filters.push(Box::new(CategoriesFilter::new(
+            self.cleanup_config
+                .ignored
+                .clone()
+                .and_then(|i| i.categories),
+        )));
         filters.push(Box::new(SonarrFilter::new(self.sonarr_api.clone())));
         filters.push(Box::new(RadarrFilter::new(self.radarr_api.clone())));
 
         for mut filter in filters {
+            debug!("Applying filter: {:?} ", filter);
             torrents = filter.filter(torrents).await?;
+            debug!("Torrents after filter: {}", torrents.len());
         }
 
         if torrents.is_empty() {
@@ -282,6 +360,11 @@ impl CleanupController {
             .iter()
             .filter_map(|t| t.hash.clone())
             .collect::<Vec<String>>();
+
+        if self.cleanup_config.dry_run.unwrap_or(false) {
+            info!("Dry run enabled, not deleting torrents");
+            return Ok(());
+        }
 
         match self
             .qbit_api
