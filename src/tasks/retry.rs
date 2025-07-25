@@ -33,9 +33,10 @@ impl StrikeData {
     }
 }
 
-const BANNED_MESSAGES: [&str; 2] = [
+const BANNED_MESSAGES: [&str; 3] = [
     "Found potentially dangerous file",
     "Invalid video file, unsupported extension",
+    "One or more episodes expected in this release were not imported or missing from the release",
 ];
 
 const MAX_NUM_STRIKES: usize = 5;
