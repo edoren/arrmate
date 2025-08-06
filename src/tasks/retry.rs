@@ -144,10 +144,8 @@ impl RetryController {
                         add_to_blocklist = true;
                     }
                 }
-            } else {
-                if let Some(strike) = self.strikes.get_mut(&download_id) {
-                    strike.last_check = current_time;
-                }
+            } else if let Some(strike) = self.strikes.get_mut(&download_id) {
+                strike.last_check = current_time;
             }
 
             if resource.status == Some(SonarrQueueStatus::Completed)
@@ -306,10 +304,8 @@ impl RetryController {
                         add_to_blocklist = true;
                     }
                 }
-            } else {
-                if let Some(strike) = self.strikes.get_mut(&download_id) {
-                    strike.last_check = current_time;
-                }
+            } else if let Some(strike) = self.strikes.get_mut(&download_id) {
+                strike.last_check = current_time;
             }
 
             if resource.tracked_download_status == Some(RadarrTrackedDownloadStatus::Warning) {

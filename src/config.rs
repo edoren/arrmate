@@ -21,72 +21,47 @@ pub struct RadarrConfig {
     pub api_key: String,
 }
 
+fn default_false() -> bool {
+    false
+}
+
+fn default_hard_links_percentage() -> u64 {
+    50
+}
+
+#[derive(Clone, Deserialize, PartialEq, Default, Debug)]
+#[serde(rename_all(serialize = "snake_case", deserialize = "snake_case"))]
+pub enum TrackerIgnore {
+    Never,
+    Always,
+    #[default]
+    HardLinks,
+}
+
 #[derive(Clone, Deserialize, Debug)]
-pub struct CleanupIgnoredTrackersConfig {
-    pub trackers: Option<Vec<String>>,
-    pub categories: Option<Vec<String>>,
+pub struct TrackerConfig {
+    pub name: String,
+    pub domains: Vec<String>,
+    pub ratio: Option<f64>,
+    pub seeding_time: Option<u64>,
+    #[serde(default = "default_false")]
+    pub require_ratio_and_seeding_time: bool,
+    #[serde(default = "default_hard_links_percentage")]
+    pub hard_links_percentage: u64,
+    pub ignore: Option<TrackerIgnore>,
 }
 
-#[derive(Clone, Debug)]
-pub enum RatioQualifier {
-    Less,
-    LessOrEqual,
-    Higher,
-    HigherOrEqual,
-}
-
-#[derive(Clone, Debug)]
-pub struct RatioConfig {
-    pub value: f64,
-    pub qualifier: RatioQualifier,
-}
-
-fn deserialize_ratio<'de, D>(deserializer: D) -> Result<Option<RatioConfig>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let ratio_str: &str = match Deserialize::deserialize(deserializer) {
-        Ok(val) => val,
-        Err(_e) => return Ok(None),
-    };
-
-    let re = Regex::new(r"^(>|<|<=|>=|=)((?:[0-9]*[.])?[0-9]+)$")
-        .map_err(|_e| serde::de::Error::custom("Val"))?;
-    let caps = re
-        .captures(ratio_str)
-        .ok_or(serde::de::Error::custom("Invalid ratio format"))?;
-
-    let ratio_qualifier_str = caps
-        .get(1)
-        .map(|val| val.as_str())
-        .ok_or(serde::de::Error::custom("Missing ratio qualifier"))?
-        .to_string();
-
-    let ratio_qualifier = match ratio_qualifier_str.as_str() {
-        ">" => RatioQualifier::Higher,
-        "<" => RatioQualifier::Less,
-        ">=" => RatioQualifier::HigherOrEqual,
-        "<=" => RatioQualifier::LessOrEqual,
-        _ => return Err(serde::de::Error::custom("Invalid ratio qualifier")),
-    };
-
-    let ratio = caps
-        .get(2)
-        .map(|val| val.as_str().parse::<f64>())
-        .ok_or(serde::de::Error::custom("Missing ratio"))?
-        .map_err(|_e| serde::de::Error::custom("Ratio is not a number"))?;
-
-    Ok(Some(RatioConfig {
-        value: ratio,
-        qualifier: ratio_qualifier,
-    }))
+#[derive(Clone, Deserialize, Debug)]
+pub struct CategoriesConfig {
+    pub name: String,
+    pub ignore: Option<bool>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct CleanupConfig {
-    #[serde(deserialize_with = "deserialize_ratio")]
-    pub ratio: Option<RatioConfig>,
-    pub ignored: Option<CleanupIgnoredTrackersConfig>,
+    pub ratio: Option<f64>,
+    pub trackers: Option<Vec<TrackerConfig>>,
+    pub categories: Option<Vec<CategoriesConfig>>,
     pub dry_run: Option<bool>,
 }
 
