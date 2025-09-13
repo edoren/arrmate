@@ -1,6 +1,36 @@
-use regex::Regex;
 use serde::{Deserialize, Deserializer};
 use url::Url;
+
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrVec;
+
+    impl<'de> serde::de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("string or list of strings")
+        }
+
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(vec![s.to_owned()])
+        }
+
+        fn visit_seq<S>(self, seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: serde::de::SeqAccess<'de>,
+        {
+            Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
+}
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct QBittorrentConfig {
@@ -41,11 +71,12 @@ pub enum TrackerIgnore {
 #[derive(Clone, Deserialize, Debug)]
 pub struct TrackerConfig {
     pub name: String,
-    pub domains: Vec<String>,
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    pub domain: Vec<String>,
     pub ratio: Option<f64>,
     pub seeding_time: Option<u64>,
     #[serde(default = "default_false")]
-    pub require_ratio_and_seeding_time: bool,
+    pub ratio_or_seeding_time: bool,
     #[serde(default = "default_hard_links_percentage")]
     pub hard_links_percentage: u64,
     pub ignore: Option<TrackerIgnore>,

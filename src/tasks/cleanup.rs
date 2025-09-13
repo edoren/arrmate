@@ -69,43 +69,6 @@ impl Debug for dyn TorrentFilter {
     }
 }
 
-struct RatioFilter {
-    ratio: Option<f64>,
-}
-
-impl RatioFilter {
-    fn new(ratio: Option<f64>) -> Self {
-        Self { ratio }
-    }
-}
-
-#[async_trait]
-impl TorrentFilter for RatioFilter {
-    fn name(&self) -> String {
-        "RatioFilter".to_string()
-    }
-
-    async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
-        let ratio = match self.ratio.as_ref() {
-            Some(val) => val,
-            None => return Ok(torrents),
-        };
-
-        let mut torrents = torrents;
-        torrents.retain(|torrent| {
-            let ignore: bool = torrent.ratio < *ratio;
-            if ignore {
-                debug!(
-                    "Ignoring torrent '{}' due to ratio {:.2} not reaching minimum required global ratio {:.2}",
-                    torrent.name, torrent.ratio, ratio
-                );
-            }
-            !ignore
-        });
-        Ok(torrents)
-    }
-}
-
 struct CategoriesFilter {
     categories: Option<Vec<CategoriesConfig>>,
 }
@@ -146,12 +109,16 @@ impl TorrentFilter for CategoriesFilter {
 }
 
 struct TrackerFilter {
+    global_ratio: Option<f64>,
     trackers: Option<Vec<TrackerConfig>>,
 }
 
 impl TrackerFilter {
-    fn new(trackers: Option<Vec<TrackerConfig>>) -> Self {
-        Self { trackers }
+    fn new(global_ratio: Option<f64>, trackers: Option<Vec<TrackerConfig>>) -> Self {
+        Self {
+            global_ratio,
+            trackers,
+        }
     }
 }
 
@@ -168,6 +135,7 @@ impl TorrentFilter for TrackerFilter {
         };
 
         let mut result = vec![];
+
         for torrent in torrents {
             let torrent_tracker_urls = torrent
                 .trackers
@@ -175,95 +143,76 @@ impl TorrentFilter for TrackerFilter {
                 .filter_map(|t| Url::parse(&t.url).ok())
                 .collect::<Vec<_>>();
 
-            let percentage_multiple_linked = if torrent.progress == 1.0 {
-                let mut result = 0.0;
-                for file in &torrent.contents {
-                    let save_path = Path::new(&torrent.save_path).join(&file.name);
-                    let metadata = match fs::metadata(&save_path).await {
-                        Ok(meta) => meta,
-                        Err(e) => {
-                            debug!(
-                                "Failed to get metadata for file '{}': {}",
-                                save_path.to_str().unwrap_or("unknown"),
-                                e
-                            );
-                            continue;
-                        }
-                    };
-                    let num_links = metadata.st_nlink();
-                    let disk_size = metadata.len();
-
-                    if num_links > 1 {
-                        result += (disk_size as f64 / torrent.total_size as f64) * 100.0;
-                    }
-                }
-
-                trace!(
-                    "Torrent '{}' has {:.0}% multiple hard linked files",
-                    torrent.name, result
-                );
-                Some(result)
-            } else {
-                None
-            };
+            let configured_trackers = trackers
+                .iter()
+                .filter(|tracker| {
+                    torrent_tracker_urls.iter().any(|url| {
+                        url.domain()
+                            .is_some_and(|v| tracker.domain.contains(&v.to_string()))
+                    })
+                })
+                .collect::<Vec<_>>();
 
             let mut ignored = false;
 
-            for tracker in trackers {
-                if !torrent_tracker_urls.iter().any(|url| {
-                    url.domain()
-                        .is_some_and(|v| tracker.domains.contains(&v.to_string()))
-                }) {
-                    continue;
-                }
+            if configured_trackers.is_empty()
+                && let Some(global_ratio) = self.global_ratio
+                && torrent.ratio < global_ratio
+            {
+                debug!(
+                    "Ignoring torrent '{}' due to ratio {:.2} not reaching minimum required global ratio {:.2}",
+                    torrent.name, torrent.ratio, global_ratio
+                );
+                ignored = true;
+            }
 
+            let percentage_multiple_linked =
+                if torrent.progress == 1.0 && !configured_trackers.is_empty() {
+                    let mut progress_size = 0;
+                    let mut total_size = 0;
+                    for content in &torrent.contents {
+                        let save_path = Path::new(&torrent.save_path).join(&content.name);
+                        let is_video = VIDEO_EXTENSIONS
+                            .iter()
+                            .any(|ext| save_path.extension().map_or(false, |e| e == *ext));
+                        if !is_video {
+                            continue;
+                        }
+                        total_size += content.size;
+                        let metadata = match fs::metadata(&save_path).await {
+                            Ok(meta) => meta,
+                            Err(e) => {
+                                debug!(
+                                    "Failed to get metadata for file '{}': {}",
+                                    save_path.to_str().unwrap_or("unknown"),
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        let num_links = metadata.st_nlink();
+                        let disk_size = metadata.len();
+
+                        if num_links > 1 {
+                            progress_size += disk_size;
+                        }
+                    }
+
+                    let result = (progress_size as f64 / total_size as f64) * 100.0;
+                    trace!(
+                        "Torrent '{}' has {:.0}% multiple hard linked files",
+                        torrent.name, result
+                    );
+                    Some(result)
+                } else {
+                    None
+                };
+
+            for tracker in configured_trackers {
                 if tracker.ignore.clone().unwrap_or_default() == TrackerIgnore::Always {
-                    ignored = true;
                     debug!(
                         "Ignoring torrent '{}' due to tracker '{}' with ignore enabled",
                         torrent.name, tracker.name
-                    );
-                    break;
-                }
-
-                let ratio_reached = tracker.ratio.map(|ratio| torrent.ratio > ratio);
-
-                let seeding_time_reached = tracker
-                    .seeding_time
-                    .map(|seeding_time| torrent.seeding_time > seeding_time);
-
-                if tracker.require_ratio_and_seeding_time
-                    && ratio_reached.is_some_and(|v| v)
-                    && seeding_time_reached.is_some_and(|v| v)
-                {
-                    debug!(
-                        "Ignoring torrent '{}' due to ratio {:.2} and seeding time {} not reaching minimum required ratio {:.2} and time {} for tracker '{}'",
-                        torrent.name,
-                        torrent.ratio,
-                        torrent.seeding_time,
-                        tracker.ratio.unwrap_or(0.0),
-                        tracker.seeding_time.unwrap_or(0),
-                        tracker.name
-                    );
-                    ignored = true;
-                    break;
-                } else if ratio_reached.is_some_and(|v| v) {
-                    debug!(
-                        "Ignoring torrent '{}' due to ratio {:.2} not reaching minimum required ratio {:.2} for tracker '{}'",
-                        torrent.name,
-                        torrent.ratio,
-                        tracker.ratio.unwrap_or(0.0),
-                        tracker.name
-                    );
-                    ignored = true;
-                    break;
-                } else if seeding_time_reached.is_some_and(|v| v) {
-                    debug!(
-                        "Ignoring torrent '{}' due to seeding time {:.2} not reaching minimum required time {:.2} for tracker '{}'",
-                        torrent.name,
-                        torrent.seeding_time,
-                        tracker.seeding_time.unwrap_or(0),
-                        tracker.name
                     );
                     ignored = true;
                     break;
@@ -273,11 +222,69 @@ impl TorrentFilter for TrackerFilter {
                     && let Some(percentage) = percentage_multiple_linked
                     && percentage >= tracker.hard_links_percentage as f64
                 {
-                    ignored = true;
                     debug!(
-                        "Ignoring torrent '{}' due to tracker '{}' with {}% multiple hard linked files",
+                        "Ignoring torrent '{}' due to tracker '{}' with {:.0}% multiple hard linked files",
                         torrent.name, tracker.name, percentage
                     );
+                    ignored = true;
+                    break;
+                }
+
+                let ratio_reached_opt = tracker.ratio.map(|ratio| torrent.ratio >= ratio);
+
+                let seeding_time_reached_opt = tracker
+                    .seeding_time
+                    .map(|seeding_time| torrent.seeding_time >= seeding_time);
+
+                if let Some(ratio_reached) = ratio_reached_opt
+                    && let Some(seeding_time_reached) = seeding_time_reached_opt
+                {
+                    if tracker.ratio_or_seeding_time && (!ratio_reached || !seeding_time_reached) {
+                        debug!(
+                            "Ignoring torrent '{}' due to ratio {:.2} or seeding time {} not reaching minimum required ratio {:.2} or time {} for tracker '{}'",
+                            torrent.name,
+                            torrent.ratio,
+                            torrent.seeding_time,
+                            tracker.ratio.unwrap_or(0.0),
+                            tracker.seeding_time.unwrap_or(0),
+                            tracker.name
+                        );
+                        ignored = true;
+                        break;
+                    } else if !ratio_reached && !seeding_time_reached {
+                        debug!(
+                            "Ignoring torrent '{}' due to ratio {:.2} and seeding time {} not reaching minimum required ratio {:.2} and time {} for tracker '{}'",
+                            torrent.name,
+                            torrent.ratio,
+                            torrent.seeding_time,
+                            tracker.ratio.unwrap_or(0.0),
+                            tracker.seeding_time.unwrap_or(0),
+                            tracker.name
+                        );
+                        ignored = true;
+                        break;
+                    }
+                } else if ratio_reached_opt.is_some_and(|ratio_reached| !ratio_reached) {
+                    debug!(
+                        "Ignoring torrent '{}' due to ratio {:.2} not reaching minimum required ratio {:.2} for tracker '{}'",
+                        torrent.name,
+                        torrent.ratio,
+                        tracker.ratio.unwrap_or(0.0),
+                        tracker.name
+                    );
+                    ignored = true;
+                    break;
+                } else if seeding_time_reached_opt
+                    .is_some_and(|seeding_time_reached| !seeding_time_reached)
+                {
+                    debug!(
+                        "Ignoring torrent '{}' due to seeding time {:.2} not reaching minimum required time {:.2} for tracker '{}'",
+                        torrent.name,
+                        torrent.seeding_time,
+                        tracker.seeding_time.unwrap_or(0),
+                        tracker.name
+                    );
+                    ignored = true;
                     break;
                 }
             }
@@ -531,13 +538,11 @@ impl CleanupController {
         // };
 
         let mut filters: Vec<Box<dyn TorrentFilter>> = Vec::new();
-        filters.push(Box::new(RatioFilter::new(
-            self.cleanup_config.ratio.clone(),
-        )));
         filters.push(Box::new(CategoriesFilter::new(
             self.cleanup_config.categories.clone(),
         )));
         filters.push(Box::new(TrackerFilter::new(
+            self.cleanup_config.ratio.clone(),
             self.cleanup_config.trackers.clone(),
         )));
         filters.push(Box::new(SonarrFilter::new(self.sonarr_api.clone())));
