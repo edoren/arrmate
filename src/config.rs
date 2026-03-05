@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Deserializer};
 use url::Url;
 
@@ -74,7 +76,8 @@ pub struct TrackerConfig {
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     pub domain: Vec<String>,
     pub ratio: Option<f64>,
-    pub seeding_time: Option<u64>,
+    #[serde(with = "humantime_serde::option", default)]
+    pub seeding_time: Option<Duration>,
     #[serde(default = "default_false")]
     pub ratio_or_seeding_time: bool,
     #[serde(default = "default_hard_links_percentage")]

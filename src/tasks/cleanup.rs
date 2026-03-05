@@ -32,12 +32,14 @@ static VIDEO_EXTENSIONS: [&str; 38] = [
 struct Torrent {
     name: String,
     hash: String,
+    #[allow(unused)]
     total_size: i64,
     save_path: String,
     category: String,
     ratio: f64,
-    seeding_time: u64,
+    seeding_time: Duration,
     progress: f64,
+    #[allow(unused)]
     last_activity: Option<OffsetDateTime>,
     trackers: Vec<qbit_rs::model::Tracker>,
     contents: Vec<qbit_rs::model::TorrentContent>,
@@ -244,9 +246,11 @@ impl TorrentFilter for TrackerFilter {
                             "Ignoring torrent '{}' due to ratio {:.2} or seeding time {} not reaching minimum required ratio {:.2} or time {} for tracker '{}'",
                             torrent.name,
                             torrent.ratio,
-                            torrent.seeding_time,
+                            humantime::format_duration(torrent.seeding_time),
                             tracker.ratio.unwrap_or(0.0),
-                            tracker.seeding_time.unwrap_or(0),
+                            humantime::format_duration(
+                                tracker.seeding_time.unwrap_or(Duration::from_secs(0))
+                            ),
                             tracker.name
                         );
                         ignored = true;
@@ -256,9 +260,11 @@ impl TorrentFilter for TrackerFilter {
                             "Ignoring torrent '{}' due to ratio {:.2} and seeding time {} not reaching minimum required ratio {:.2} and time {} for tracker '{}'",
                             torrent.name,
                             torrent.ratio,
-                            torrent.seeding_time,
+                            humantime::format_duration(torrent.seeding_time),
                             tracker.ratio.unwrap_or(0.0),
-                            tracker.seeding_time.unwrap_or(0),
+                            humantime::format_duration(
+                                tracker.seeding_time.unwrap_or(Duration::from_secs(0))
+                            ),
                             tracker.name
                         );
                         ignored = true;
@@ -278,10 +284,12 @@ impl TorrentFilter for TrackerFilter {
                     .is_some_and(|seeding_time_reached| !seeding_time_reached)
                 {
                     debug!(
-                        "Ignoring torrent '{}' due to seeding time {:.2} not reaching minimum required time {:.2} for tracker '{}'",
+                        "Ignoring torrent '{}' due to seeding time {} not reaching minimum required time {} for tracker '{}'",
                         torrent.name,
-                        torrent.seeding_time,
-                        tracker.seeding_time.unwrap_or(0),
+                        humantime::format_duration(torrent.seeding_time),
+                        humantime::format_duration(
+                            tracker.seeding_time.unwrap_or(Duration::from_secs(0))
+                        ),
                         tracker.name
                     );
                     ignored = true;
@@ -466,7 +474,9 @@ async fn process_torrent(qbit_api: &Qbit, torrent: qbit_rs::model::Torrent) -> R
         save_path,
         category: torrent.category.unwrap_or_default(),
         ratio: torrent.ratio.unwrap_or(0.0),
-        seeding_time: torrent.seeding_time.unwrap_or(0).try_into().unwrap_or(0),
+        seeding_time: Duration::from_secs(
+            torrent.seeding_time.unwrap_or(0).try_into().unwrap_or(0),
+        ),
         progress: torrent.progress.unwrap_or(0.0),
         last_activity: torrent
             .last_activity

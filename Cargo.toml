@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = "1.0"
 async-trait = "0.1"
 edolib = { git = "https://github.com/edoren/edolib-rs.git" }
+humantime = "2.3"
+humantime-serde = "1.1"
 log = "0.4"
 notify = "8.2.0"
 qbit-rs = { git = "https://github.com/edoren/qbit", branch = "torrent_content_piece_range_fix" }
