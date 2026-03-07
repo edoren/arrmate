@@ -8,8 +8,7 @@ use radarr::{
         queue_api::{ApiV3QueueBulkDeleteParams, ApiV3QueueGetParams},
     },
     models::{
-        RadarrHealthCheckResult, RadarrQueueBulkResource, RadarrQueueResource,
-        RadarrQueueResourcePagingResource, RadarrSystemResource,
+        RadarrHealthCheckResult, RadarrQueueBulkResource, RadarrQueueResource, RadarrSystemResource,
     },
 };
 

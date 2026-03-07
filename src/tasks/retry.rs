@@ -14,7 +14,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     apis::{radarr::RadarrAPI, sonarr::SonarrAPI},
-    config::{RadarrConfig, RetryConfig, SonarrConfig},
+    config::{ConfigData, RadarrConfig, RetryConfig, SonarrConfig},
+    tasks::Task,
 };
 
 struct StrikeData {
@@ -51,6 +52,14 @@ pub struct RetryController {
 }
 
 impl RetryController {
+    pub fn from_config(config: &ConfigData) -> Option<Self> {
+        let mut retry_config = config.retry.clone()?;
+        retry_config.dry_run = config.dry_run.or(retry_config.dry_run);
+        let sonarr_config = config.sonarr.as_ref()?;
+        let radarr_config = config.radarr.as_ref()?;
+        Self::new(retry_config, sonarr_config, radarr_config).ok()
+    }
+
     pub fn new(
         retry_config: RetryConfig,
         sonarr_config: &SonarrConfig,
@@ -64,7 +73,7 @@ impl RetryController {
         })
     }
 
-    pub async fn execute(&mut self) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         let sonarr_queue_items = self.sonarr_api.get_queue().await?;
         let radarr_queue_items = self.radarr_api.get_queue().await?;
 
@@ -405,5 +414,16 @@ impl RetryController {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Task for RetryController {
+    fn name(&self) -> &str {
+        "retry"
+    }
+
+    async fn execute(&mut self) -> Result<()> {
+        self.run().await
     }
 }

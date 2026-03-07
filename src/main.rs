@@ -6,7 +6,7 @@ use notify::{
     EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{AccessKind, AccessMode},
 };
-use tasks::{cleanup::CleanupController, retry::RetryController};
+use tasks::{Task, cleanup::CleanupController, retry::RetryController};
 use tokio::fs;
 
 mod apis;
@@ -64,8 +64,7 @@ async fn run() -> Result<()> {
 
     let mut config_changed = true;
 
-    let mut cleanup_controller: Option<CleanupController> = None;
-    let mut retry_controller: Option<RetryController> = None;
+    let mut tasks: Vec<Box<dyn Task>> = Vec::new();
 
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
@@ -103,47 +102,22 @@ async fn run() -> Result<()> {
                 .await
                 .map_err(|e| anyhow!("Failed to reload config: {e}"))?;
 
-            cleanup_controller = {
-                let config = config.clone();
-                let mut cleanup_config = config.cleanup;
-                cleanup_config.dry_run = config.dry_run.or(cleanup_config.dry_run);
-                CleanupController::new(
-                    cleanup_config,
-                    config.qbittorrent,
-                    config.sonarr,
-                    config.radarr,
-                )
-                .ok()
-            };
+            tasks = [
+                CleanupController::from_config(&config).map(|c| Box::new(c) as Box<dyn Task>),
+                RetryController::from_config(&config).map(|c| Box::new(c) as Box<dyn Task>),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
 
-            retry_controller = if let ConfigData {
-                retry: Some(mut retry_config),
-                sonarr: Some(sonarr_config),
-                radarr: Some(radarr_config),
-                dry_run: main_dry_run,
-                ..
-            } = config
-            {
-                retry_config.dry_run = main_dry_run.or(retry_config.dry_run);
-                RetryController::new(retry_config, &sonarr_config, &radarr_config).ok()
-            } else {
-                None
-            };
-
-            interval = tokio::time::interval(Duration::from_secs(config.refresh_interval));
+            interval = tokio::time::interval(config.refresh_interval);
 
             config_changed = false;
         } else if run_controllers {
-            if let Some(cleanup_controller) = cleanup_controller.as_mut()
-                && let Err(e) = cleanup_controller.execute().await
-            {
-                warn!("Cleanup task ignored due to error: {e}");
-            }
-
-            if let Some(retry_controller) = retry_controller.as_mut()
-                && let Err(e) = retry_controller.execute().await
-            {
-                warn!("Retry task ignored due to error: {e}");
+            for task in &mut tasks {
+                if let Err(e) = task.execute().await {
+                    warn!("{} task ignored due to error: {e}", task.name());
+                }
             }
         }
     }

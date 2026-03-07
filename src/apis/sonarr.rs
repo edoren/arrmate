@@ -8,8 +8,7 @@ use sonarr::{
         queue_api::{ApiV3QueueBulkDeleteParams, ApiV3QueueGetParams},
     },
     models::{
-        SonarrHealthCheckResult, SonarrQueueBulkResource, SonarrQueueResource,
-        SonarrQueueResourcePagingResource, SonarrSystemResource,
+        SonarrHealthCheckResult, SonarrQueueBulkResource, SonarrQueueResource, SonarrSystemResource,
     },
 };
 

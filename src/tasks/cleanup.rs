@@ -17,9 +17,10 @@ use url::Url;
 use crate::{
     apis::{radarr::RadarrAPI, sonarr::SonarrAPI},
     config::{
-        CategoriesConfig, CleanupConfig, QBittorrentConfig, RadarrConfig, SonarrConfig,
+        CategoriesConfig, CleanupConfig, ConfigData, QBittorrentConfig, RadarrConfig, SonarrConfig,
         TrackerConfig, TrackerIgnore,
     },
+    tasks::Task,
 };
 
 static VIDEO_EXTENSIONS: [&str; 38] = [
@@ -60,7 +61,7 @@ impl std::hash::Hash for Torrent {
 }
 
 #[async_trait]
-trait TorrentFilter {
+trait TorrentFilter: Send {
     fn name(&self) -> String;
     async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>>;
 }
@@ -96,7 +97,7 @@ impl TorrentFilter for CategoriesFilter {
         let mut result = vec![];
         for torrent in torrents {
             if categories.iter().any(|category| {
-                category.ignore.unwrap_or(false) && category.name == torrent.category
+                category.ignore && category.name == torrent.category
             }) {
                 debug!(
                     "Ignoring torrent '{}' due to category '{}'",
@@ -220,7 +221,7 @@ impl TorrentFilter for TrackerFilter {
                     break;
                 }
 
-                if tracker.ignore.clone().unwrap_or_default() == TrackerIgnore::HardLinks
+                if tracker.ignore.clone().unwrap_or_default() == TrackerIgnore::WhenHardLinked
                     && let Some(percentage) = percentage_multiple_linked
                     && percentage >= tracker.hard_links_percentage as f64
                 {
@@ -241,7 +242,7 @@ impl TorrentFilter for TrackerFilter {
                 if let Some(ratio_reached) = ratio_reached_opt
                     && let Some(seeding_time_reached) = seeding_time_reached_opt
                 {
-                    if tracker.ratio_or_seeding_time && (!ratio_reached || !seeding_time_reached) {
+                    if tracker.require_both && (!ratio_reached || !seeding_time_reached) {
                         debug!(
                             "Ignoring torrent '{}' due to ratio {:.2} or seeding time {} not reaching minimum required ratio {:.2} or time {} for tracker '{}'",
                             torrent.name,
@@ -511,6 +512,18 @@ async fn get_torrents(qbit_api: &Qbit) -> Result<Vec<Torrent>> {
 }
 
 impl CleanupController {
+    pub fn from_config(config: &ConfigData) -> Option<Self> {
+        let mut cleanup_config = config.cleanup.clone()?;
+        cleanup_config.dry_run = config.dry_run.or(cleanup_config.dry_run);
+        Self::new(
+            cleanup_config,
+            config.qbittorrent.clone(),
+            config.sonarr.clone(),
+            config.radarr.clone(),
+        )
+        .ok()
+    }
+
     pub fn new(
         cleanup_config: CleanupConfig,
         qbittorrent_config: QBittorrentConfig,
@@ -528,7 +541,7 @@ impl CleanupController {
         })
     }
 
-    pub async fn execute(&mut self) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         let mut torrents = get_torrents(&self.qbit_api).await?;
 
         // let contents = {
@@ -594,5 +607,16 @@ impl CleanupController {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Task for CleanupController {
+    fn name(&self) -> &str {
+        "cleanup"
+    }
+
+    async fn execute(&mut self) -> Result<()> {
+        self.run().await
     }
 }

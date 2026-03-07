@@ -53,10 +53,6 @@ pub struct RadarrConfig {
     pub api_key: String,
 }
 
-fn default_false() -> bool {
-    false
-}
-
 fn default_hard_links_percentage() -> u64 {
     50
 }
@@ -67,7 +63,7 @@ pub enum TrackerIgnore {
     Never,
     Always,
     #[default]
-    HardLinks,
+    WhenHardLinked,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -78,8 +74,8 @@ pub struct TrackerConfig {
     pub ratio: Option<f64>,
     #[serde(with = "humantime_serde::option", default)]
     pub seeding_time: Option<Duration>,
-    #[serde(default = "default_false")]
-    pub ratio_or_seeding_time: bool,
+    #[serde(default)]
+    pub require_both: bool,
     #[serde(default = "default_hard_links_percentage")]
     pub hard_links_percentage: u64,
     pub ignore: Option<TrackerIgnore>,
@@ -88,7 +84,8 @@ pub struct TrackerConfig {
 #[derive(Clone, Deserialize, Debug)]
 pub struct CategoriesConfig {
     pub name: String,
-    pub ignore: Option<bool>,
+    #[serde(default)]
+    pub ignore: bool,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -101,32 +98,30 @@ pub struct CleanupConfig {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct RetryConfig {
-    pub timeout: u64,
+    #[serde(with = "humantime_serde")]
+    #[allow(unused)]
+    pub timeout: Duration,
     pub dry_run: Option<bool>,
 }
 
-fn deserialize_refresh_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
+fn deserialize_refresh_interval<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Deserialize::deserialize(deserializer)
-        .or_else(|_e| Ok(60))
-        .and_then(|s| {
-            if s >= 60 && s <= 3600 {
-                Ok(s)
-            } else {
-                Err(serde::de::Error::custom(
-                    "Interval should be between 60 and 3600 seconds",
-                ))
-            }
-        })
+    let dur: Duration = humantime_serde::deserialize(deserializer)?;
+    if dur < Duration::from_secs(60) || dur > Duration::from_secs(3600) {
+        return Err(serde::de::Error::custom(
+            "refresh_interval should be between 1min and 1h",
+        ));
+    }
+    Ok(dur)
 }
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct ConfigData {
     #[serde(deserialize_with = "deserialize_refresh_interval")]
-    pub refresh_interval: u64,
-    pub cleanup: CleanupConfig,
+    pub refresh_interval: Duration,
+    pub cleanup: Option<CleanupConfig>,
     pub retry: Option<RetryConfig>,
     pub qbittorrent: QBittorrentConfig,
     pub sonarr: Option<SonarrConfig>,
