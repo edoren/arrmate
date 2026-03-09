@@ -1,7 +1,12 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
-use log::info;
+use async_trait::async_trait;
+use log::{info, warn};
 use radarr::models::{
     RadarrQueueStatus, RadarrTrackedDownloadState, RadarrTrackedDownloadStatus,
     RadarrTrackedDownloadStatusMessage,
@@ -57,7 +62,9 @@ impl RetryController {
         retry_config.dry_run = config.dry_run.or(retry_config.dry_run);
         let sonarr_config = config.sonarr.as_ref()?;
         let radarr_config = config.radarr.as_ref()?;
-        Self::new(retry_config, sonarr_config, radarr_config).ok()
+        Self::new(retry_config, sonarr_config, radarr_config)
+            .map_err(|e| warn!("Failed to initialize retry task: {e}"))
+            .ok()
     }
 
     pub fn new(
@@ -74,8 +81,8 @@ impl RetryController {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let sonarr_queue_items = self.sonarr_api.get_queue().await?;
-        let radarr_queue_items = self.radarr_api.get_queue().await?;
+        let (sonarr_queue_items, radarr_queue_items) =
+            tokio::try_join!(self.sonarr_api.get_queue(), self.radarr_api.get_queue())?;
 
         let mut sonarr_ids_to_remove = Vec::new();
         let mut sonarr_ids_to_remove_and_blocklist = Vec::new();
@@ -141,9 +148,9 @@ impl RetryController {
 
                 if let Some(completion_time) = resource
                     .added
-                    .clone()
-                    .unwrap_or_default()
-                    .and_then(|date_str| OffsetDateTime::parse(&date_str, &Rfc3339).ok())
+                    .as_ref()
+                    .and_then(|inner| inner.as_deref())
+                    .and_then(|date_str| OffsetDateTime::parse(date_str, &Rfc3339).ok())
                 {
                     let timeout_datetime = completion_time + Duration::from_secs(3600);
                     let progress_size =
@@ -301,9 +308,9 @@ impl RetryController {
 
                 if let Some(completion_time) = resource
                     .added
-                    .clone()
-                    .unwrap_or_default()
-                    .and_then(|date_str| OffsetDateTime::parse(&date_str, &Rfc3339).ok())
+                    .as_ref()
+                    .and_then(|inner| inner.as_deref())
+                    .and_then(|date_str| OffsetDateTime::parse(date_str, &Rfc3339).ok())
                 {
                     let timeout_datetime = completion_time + Duration::from_secs(3600);
                     let progress_size =
@@ -343,18 +350,6 @@ impl RetryController {
                         }
                     }
                 }
-
-                // if let Some(completion_time) = resource
-                //     .estimated_completion_time
-                //     .clone()
-                //     .unwrap_or_default()
-                //     .and_then(|date_str| OffsetDateTime::parse(&date_str, &Rfc3339).ok())
-                // {
-                //     let timeout_datetime = completion_time + Duration::from_secs(retry_config.timeout);
-                //     if OffsetDateTime::now_utc() > timeout_datetime {
-                //         add_to_remove = true;
-                //     }
-                // }
             }
 
             if add_to_remove {
@@ -417,7 +412,7 @@ impl RetryController {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Task for RetryController {
     fn name(&self) -> &str {
         "retry"
