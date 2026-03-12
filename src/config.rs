@@ -123,8 +123,7 @@ pub struct ConfigData {
     pub refresh_interval: Duration,
     pub cleanup: Option<CleanupConfig>,
     pub retry: Option<RetryConfig>,
-    pub qbittorrent: QBittorrentConfig,
+    pub qbittorrent: Option<QBittorrentConfig>,
     pub sonarr: Option<SonarrConfig>,
     pub radarr: Option<RadarrConfig>,
-    pub dry_run: Option<bool>,
 }

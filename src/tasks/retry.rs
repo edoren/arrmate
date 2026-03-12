@@ -1,25 +1,16 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use log::{info, warn};
-use radarr::models::{
-    RadarrQueueStatus, RadarrTrackedDownloadState, RadarrTrackedDownloadStatus,
-    RadarrTrackedDownloadStatusMessage,
-};
-use sonarr::models::{
-    SonarrQueueStatus, SonarrTrackedDownloadState, SonarrTrackedDownloadStatus,
-    SonarrTrackedDownloadStatusMessage,
-};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use log::info;
+use time::OffsetDateTime;
 
 use crate::{
-    apis::{radarr::RadarrAPI, sonarr::SonarrAPI},
-    config::{ConfigData, RadarrConfig, RetryConfig, SonarrConfig},
+    apis::{
+        QueueStatus, SonarrAndRadarrAPIInterface, TrackedDownloadState, TrackedDownloadStatus,
+        TrackedDownloadStatusMessage,
+    },
+    config::RetryConfig,
     tasks::Task,
 };
 
@@ -50,39 +41,32 @@ const STALLED_INTERVAL: Duration = Duration::from_secs(60 * 5);
 
 pub struct RetryController {
     retry_config: RetryConfig,
-    sonarr_api: Arc<SonarrAPI>,
-    radarr_api: Arc<RadarrAPI>,
+    sonarr: Arc<dyn SonarrAndRadarrAPIInterface>,
+    radarr: Arc<dyn SonarrAndRadarrAPIInterface>,
 
     strikes: HashMap<String, StrikeData>,
 }
 
 impl RetryController {
-    pub fn from_config(config: &ConfigData) -> Option<Self> {
-        let mut retry_config = config.retry.clone()?;
-        retry_config.dry_run = config.dry_run.or(retry_config.dry_run);
-        let sonarr_config = config.sonarr.as_ref()?;
-        let radarr_config = config.radarr.as_ref()?;
-        Self::new(retry_config, sonarr_config, radarr_config)
-            .map_err(|e| warn!("Failed to initialize retry task: {e}"))
-            .ok()
-    }
-
     pub fn new(
         retry_config: RetryConfig,
-        sonarr_config: &SonarrConfig,
-        radarr_config: &RadarrConfig,
+        sonarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
+        radarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
     ) -> Result<Self> {
-        Ok(Self {
-            retry_config,
-            sonarr_api: Arc::new(SonarrAPI::new(&sonarr_config)?),
-            radarr_api: Arc::new(RadarrAPI::new(&radarr_config)?),
-            strikes: HashMap::new(),
-        })
+        sonarr
+            .zip(radarr)
+            .map(|(sonarr, radarr)| Self {
+                retry_config,
+                sonarr,
+                radarr,
+                strikes: HashMap::new(),
+            })
+            .context("Could not initialize retry task")
     }
 
     async fn run(&mut self) -> Result<()> {
         let (sonarr_queue_items, radarr_queue_items) =
-            tokio::try_join!(self.sonarr_api.get_queue(), self.radarr_api.get_queue())?;
+            tokio::try_join!(self.sonarr.get_queue(), self.radarr.get_queue())?;
 
         let mut sonarr_ids_to_remove = Vec::new();
         let mut sonarr_ids_to_remove_and_blocklist = Vec::new();
@@ -91,11 +75,8 @@ impl RetryController {
         let mut radarr_ids_to_remove_and_blocklist = Vec::new();
 
         for resource in sonarr_queue_items {
-            if resource.id.is_none() {
-                continue;
-            }
-            let download_id = match resource.download_id.as_ref().and_then(|val| val.as_deref()) {
-                Some(val) => val.to_string(),
+            let download_id = match resource.download_id.as_ref() {
+                Some(val) => val,
                 None => continue,
             };
             let current_time = OffsetDateTime::now_utc();
@@ -103,20 +84,20 @@ impl RetryController {
             let mut add_to_remove = false;
             let mut add_to_blocklist = false;
 
-            if resource.status == Some(SonarrQueueStatus::Warning) {
-                if resource.tracked_download_state == Some(SonarrTrackedDownloadState::Downloading)
-                    && resource.error_message.as_ref().is_some_and(|val| {
-                        val.as_deref()
-                            .is_some_and(|val| val.contains("The download is stalled"))
-                    })
+            if resource.status == QueueStatus::Warning {
+                if resource.tracked_download_state == TrackedDownloadState::Downloading
+                    && resource
+                        .error_message
+                        .as_ref()
+                        .is_some_and(|val| val.contains("The download is stalled"))
                 {
-                    let current_sizeleft = resource.sizeleft.unwrap_or(f64::MAX) as i64;
+                    let current_sizeleft = resource.sizeleft;
                     let strike =
                         self.strikes
                             .entry(download_id.clone())
                             .or_insert(StrikeData::new(
                                 0,
-                                resource.sizeleft.unwrap_or(f64::MAX) as i64,
+                                resource.sizeleft,
                                 current_time - STALLED_INTERVAL,
                             ));
 
@@ -129,63 +110,43 @@ impl RetryController {
                         strike.last_check = current_time;
                         info!(
                             "Torrent '{}' is stalled, strikes {}/{}",
-                            resource
-                                .title
-                                .as_ref()
-                                .and_then(|v| v.as_deref())
-                                .unwrap_or_default(),
+                            resource.title.as_deref().unwrap_or("Unknown"),
                             strike.num,
                             MAX_NUM_STRIKES
                         );
                     }
 
                     if strike.num >= MAX_NUM_STRIKES {
-                        self.strikes.remove(&download_id);
+                        self.strikes.remove(download_id);
                         add_to_remove = true;
                         add_to_blocklist = true;
                     }
                 }
 
-                if let Some(completion_time) = resource
-                    .added
-                    .as_ref()
-                    .and_then(|inner| inner.as_deref())
-                    .and_then(|date_str| OffsetDateTime::parse(date_str, &Rfc3339).ok())
-                {
+                if let Some(completion_time) = resource.added {
                     let timeout_datetime = completion_time + Duration::from_secs(3600);
-                    let progress_size =
-                        resource.size.unwrap_or_default() - resource.sizeleft.unwrap_or_default();
-                    if OffsetDateTime::now_utc() > timeout_datetime && progress_size == 0.0 {
+                    let progress_size = resource.size - resource.sizeleft;
+                    if OffsetDateTime::now_utc() > timeout_datetime && progress_size == 0 {
                         add_to_remove = true;
                         add_to_blocklist = true;
                     }
                 }
-            } else if let Some(strike) = self.strikes.get_mut(&download_id) {
+            } else if let Some(strike) = self.strikes.get_mut(download_id) {
                 strike.last_check = current_time;
             }
 
-            if resource.status == Some(SonarrQueueStatus::Completed)
-                && resource.tracked_download_status == Some(SonarrTrackedDownloadStatus::Warning)
+            if resource.status == QueueStatus::Completed
+                && resource.tracked_download_status == TrackedDownloadStatus::Warning
             {
-                if resource.tracked_download_state
-                    == Some(SonarrTrackedDownloadState::ImportPending)
-                {
-                    for SonarrTrackedDownloadStatusMessage { title: _, messages } in resource
-                        .status_messages
-                        .clone()
-                        .unwrap_or_default()
-                        .unwrap_or_default()
+                if resource.tracked_download_state == TrackedDownloadState::ImportPending {
+                    for TrackedDownloadStatusMessage { title: _, messages } in
+                        &resource.status_messages
                     {
-                        if messages
-                            .unwrap_or_default()
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|msg| {
-                                BANNED_MESSAGES
-                                    .iter()
-                                    .any(|banned_msg| msg.contains(banned_msg))
-                            })
-                        {
+                        if messages.iter().any(|msg| {
+                            BANNED_MESSAGES
+                                .iter()
+                                .any(|banned_msg| msg.contains(banned_msg))
+                        }) {
                             add_to_remove = true;
                             add_to_blocklist = true;
                             break;
@@ -206,18 +167,15 @@ impl RetryController {
         if !sonarr_ids_to_remove.is_empty() {
             let removed: Vec<&String> = sonarr_ids_to_remove
                 .iter()
-                .filter_map(|res| res.title.as_ref().and_then(|inner| inner.as_ref()))
+                .filter_map(|res| res.title.as_ref())
                 .collect();
             if self.retry_config.dry_run.unwrap_or(false) {
                 info!("Dry run enabled, not removing: {removed:?}");
             } else {
                 info!("Following queue removed: {removed:?}");
-                self.sonarr_api
-                    .queue_id_delete_bulk(
-                        sonarr_ids_to_remove
-                            .into_iter()
-                            .filter_map(|res| res.id)
-                            .collect(),
+                self.sonarr
+                    .queue_bulk_delete(
+                        sonarr_ids_to_remove.into_iter().map(|res| res.id).collect(),
                         Some(true),
                         Some(false),
                         Some(false),
@@ -229,17 +187,17 @@ impl RetryController {
         if !sonarr_ids_to_remove_and_blocklist.is_empty() {
             let removed: Vec<&String> = sonarr_ids_to_remove_and_blocklist
                 .iter()
-                .filter_map(|res| res.title.as_ref().and_then(|inner| inner.as_ref()))
+                .filter_map(|res| res.title.as_ref())
                 .collect();
             if self.retry_config.dry_run.unwrap_or(false) {
                 info!("Dry run enabled, not removing and blocking: {removed:?}");
             } else {
                 info!("Following queue removed and blocked: {removed:?}");
-                self.sonarr_api
-                    .queue_id_delete_bulk(
+                self.sonarr
+                    .queue_bulk_delete(
                         sonarr_ids_to_remove_and_blocklist
                             .into_iter()
-                            .filter_map(|res| res.id)
+                            .map(|res| res.id)
                             .collect(),
                         Some(true),
                         Some(true),
@@ -251,11 +209,8 @@ impl RetryController {
         }
 
         for resource in radarr_queue_items {
-            if resource.id.is_none() {
-                continue;
-            }
-            let download_id = match resource.download_id.as_ref().and_then(|val| val.as_deref()) {
-                Some(val) => val.to_string(),
+            let download_id = match resource.download_id.as_ref() {
+                Some(val) => val,
                 None => continue,
             };
             let current_time = OffsetDateTime::now_utc();
@@ -263,20 +218,20 @@ impl RetryController {
             let mut add_to_remove = false;
             let mut add_to_blocklist = false;
 
-            if resource.status == Some(RadarrQueueStatus::Warning) {
-                if resource.tracked_download_state == Some(RadarrTrackedDownloadState::Downloading)
-                    && resource.error_message.as_ref().is_some_and(|val| {
-                        val.as_deref()
-                            .is_some_and(|val| val.contains("The download is stalled"))
-                    })
+            if resource.status == QueueStatus::Warning {
+                if resource.tracked_download_state == TrackedDownloadState::Downloading
+                    && resource
+                        .error_message
+                        .as_ref()
+                        .is_some_and(|val| val.contains("The download is stalled"))
                 {
-                    let current_sizeleft = resource.sizeleft.unwrap_or(f64::MAX) as i64;
+                    let current_sizeleft = resource.sizeleft;
                     let strike =
                         self.strikes
                             .entry(download_id.clone())
                             .or_insert(StrikeData::new(
                                 0,
-                                resource.sizeleft.unwrap_or(f64::MAX) as i64,
+                                resource.sizeleft,
                                 current_time - STALLED_INTERVAL,
                             ));
 
@@ -289,61 +244,41 @@ impl RetryController {
                         strike.last_check = current_time;
                         info!(
                             "Torrent '{}' is stalled, strikes {}/{}",
-                            resource
-                                .title
-                                .as_ref()
-                                .and_then(|v| v.as_deref())
-                                .unwrap_or_default(),
+                            resource.title.as_deref().unwrap_or("Unknown"),
                             strike.num,
                             MAX_NUM_STRIKES
                         );
                     }
 
                     if strike.num >= MAX_NUM_STRIKES {
-                        self.strikes.remove(&download_id);
+                        self.strikes.remove(download_id);
                         add_to_remove = true;
                         add_to_blocklist = true;
                     }
                 }
 
-                if let Some(completion_time) = resource
-                    .added
-                    .as_ref()
-                    .and_then(|inner| inner.as_deref())
-                    .and_then(|date_str| OffsetDateTime::parse(date_str, &Rfc3339).ok())
-                {
+                if let Some(completion_time) = resource.added {
                     let timeout_datetime = completion_time + Duration::from_secs(3600);
-                    let progress_size =
-                        resource.size.unwrap_or_default() - resource.sizeleft.unwrap_or_default();
-                    if OffsetDateTime::now_utc() > timeout_datetime && progress_size == 0.0 {
+                    let progress_size = resource.size - resource.sizeleft;
+                    if OffsetDateTime::now_utc() > timeout_datetime && progress_size == 0 {
                         add_to_remove = true;
                         add_to_blocklist = true;
                     }
                 }
-            } else if let Some(strike) = self.strikes.get_mut(&download_id) {
+            } else if let Some(strike) = self.strikes.get_mut(download_id) {
                 strike.last_check = current_time;
             }
 
-            if resource.tracked_download_status == Some(RadarrTrackedDownloadStatus::Warning) {
-                if resource.tracked_download_state
-                    == Some(RadarrTrackedDownloadState::ImportPending)
-                {
-                    for RadarrTrackedDownloadStatusMessage { title: _, messages } in resource
-                        .status_messages
-                        .clone()
-                        .unwrap_or_default()
-                        .unwrap_or_default()
+            if resource.tracked_download_status == TrackedDownloadStatus::Warning {
+                if resource.tracked_download_state == TrackedDownloadState::ImportPending {
+                    for TrackedDownloadStatusMessage { title: _, messages } in
+                        &resource.status_messages
                     {
-                        if messages
-                            .unwrap_or_default()
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|msg| {
-                                BANNED_MESSAGES
-                                    .iter()
-                                    .any(|banned_msg| msg.contains(banned_msg))
-                            })
-                        {
+                        if messages.iter().any(|msg| {
+                            BANNED_MESSAGES
+                                .iter()
+                                .any(|banned_msg| msg.contains(banned_msg))
+                        }) {
                             add_to_remove = true;
                             add_to_blocklist = true;
                             break;
@@ -364,18 +299,15 @@ impl RetryController {
         if !radarr_ids_to_remove.is_empty() {
             let removed: Vec<&String> = radarr_ids_to_remove
                 .iter()
-                .filter_map(|res| res.title.as_ref().and_then(|inner| inner.as_ref()))
+                .filter_map(|res| res.title.as_ref())
                 .collect();
             if self.retry_config.dry_run.unwrap_or(false) {
                 info!("Dry run enabled, not removing: {removed:?}");
             } else {
                 info!("Following queue removed: {removed:?}");
-                self.radarr_api
-                    .queue_id_delete_bulk(
-                        radarr_ids_to_remove
-                            .into_iter()
-                            .filter_map(|res| res.id)
-                            .collect(),
+                self.radarr
+                    .queue_bulk_delete(
+                        radarr_ids_to_remove.into_iter().map(|res| res.id).collect(),
                         Some(true),
                         Some(false),
                         Some(false),
@@ -387,17 +319,17 @@ impl RetryController {
         if !radarr_ids_to_remove_and_blocklist.is_empty() {
             let removed: Vec<&String> = radarr_ids_to_remove_and_blocklist
                 .iter()
-                .filter_map(|res| res.title.as_ref().and_then(|inner| inner.as_ref()))
+                .filter_map(|res| res.title.as_ref())
                 .collect();
             if self.retry_config.dry_run.unwrap_or(false) {
                 info!("Dry run enabled, not removing and blocking: {removed:?}");
             } else {
                 info!("Following queue removed and blocked: {removed:?}");
-                self.radarr_api
-                    .queue_id_delete_bulk(
+                self.radarr
+                    .queue_bulk_delete(
                         radarr_ids_to_remove_and_blocklist
                             .into_iter()
-                            .filter_map(|res| res.id)
+                            .map(|res| res.id)
                             .collect(),
                         Some(true),
                         Some(true),

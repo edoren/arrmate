@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use log::{error, info, trace, warn};
@@ -14,6 +14,10 @@ mod config;
 mod tasks;
 
 use config::ConfigData;
+
+use crate::apis::{
+    SonarrAndRadarrAPIInterface, qbittorrent::{QBittorrentAPI, QBittorrentAPIInterface}, radarr::RadarrAPI, sonarr::SonarrAPI
+};
 
 async fn get_config() -> Result<ConfigData> {
     Ok(serde_yaml::from_str(
@@ -66,6 +70,10 @@ async fn run() -> Result<()> {
 
     let mut tasks: Vec<Box<dyn Task>> = Vec::new();
 
+    let mut qbittorrent_api: Option<Arc<dyn QBittorrentAPIInterface>>;
+    let mut sonarr_api: Option<Arc<dyn SonarrAndRadarrAPIInterface>>;
+    let mut radarr_api: Option<Arc<dyn SonarrAndRadarrAPIInterface>>;
+
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         let mut run_controllers = false;
@@ -102,13 +110,33 @@ async fn run() -> Result<()> {
                 .await
                 .map_err(|e| anyhow!("Failed to reload config: {e}"))?;
 
-            tasks = [
-                CleanupController::from_config(&config).map(|c| Box::new(c) as Box<dyn Task>),
-                RetryController::from_config(&config).map(|c| Box::new(c) as Box<dyn Task>),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
+            qbittorrent_api = config.qbittorrent.map(|config| {
+                Arc::new(QBittorrentAPI::new(&config)) as Arc<dyn QBittorrentAPIInterface>
+            });
+            sonarr_api = config.sonarr.map(|config| {
+                Arc::new(SonarrAPI::new(&config)) as Arc<dyn SonarrAndRadarrAPIInterface>
+            });
+            radarr_api = config.radarr.map(|config| {
+                Arc::new(RadarrAPI::new(&config)) as Arc<dyn SonarrAndRadarrAPIInterface>
+            });
+
+            if let Some(cleanup_config) = config.cleanup
+                && let Ok(controller) = CleanupController::new(
+                    cleanup_config,
+                    qbittorrent_api.clone(),
+                    sonarr_api.clone(),
+                    radarr_api.clone(),
+                )
+            {
+                tasks.push(Box::new(controller));
+            }
+
+            if let Some(retry_config) = config.retry
+                && let Ok(controller) =
+                    RetryController::new(retry_config, sonarr_api.clone(), radarr_api.clone())
+            {
+                tasks.push(Box::new(controller));
+            }
 
             interval = tokio::time::interval(config.refresh_interval);
 

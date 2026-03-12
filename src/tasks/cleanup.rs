@@ -5,21 +5,14 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use log::{debug, error, info, trace, warn};
-use qbit_rs::{
-    Qbit,
-    model::{Credential, GetTorrentListArg},
-};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use log::{debug, error, info, trace};
+use time::OffsetDateTime;
 use tokio::fs;
 use url::Url;
 
 use crate::{
-    apis::{radarr::RadarrAPI, sonarr::SonarrAPI},
-    config::{
-        CategoriesConfig, CleanupConfig, ConfigData, QBittorrentConfig, RadarrConfig, SonarrConfig,
-        TrackerConfig, TrackerIgnore,
-    },
+    apis::{SonarrAndRadarrAPIInterface, qbittorrent::QBittorrentAPIInterface},
+    config::{CategoriesConfig, CleanupConfig, TrackerConfig, TrackerIgnore},
     tasks::Task,
 };
 
@@ -315,12 +308,12 @@ impl TorrentFilter for TrackerFilter {
 }
 
 struct SonarrFilter {
-    sonarr_api: Option<Arc<SonarrAPI>>,
+    sonarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
 }
 
 impl SonarrFilter {
-    fn new(sonarr_api: Option<Arc<SonarrAPI>>) -> Self {
-        Self { sonarr_api }
+    fn new(sonarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>) -> Self {
+        Self { sonarr }
     }
 }
 
@@ -331,7 +324,7 @@ impl TorrentFilter for SonarrFilter {
     }
 
     async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
-        let api = match &self.sonarr_api {
+        let api = match &self.sonarr {
             Some(api) => api,
             None => return Ok(torrents),
         };
@@ -343,22 +336,18 @@ impl TorrentFilter for SonarrFilter {
         trace!("Sonarr Queue: {}", queue_items.len());
 
         // Ignore cleanup if Sonarr has started recently
-        if queue_items.is_empty()
-            && let Some(start_time) = api
-                .get_system_status()
-                .await?
-                .start_time
-                .and_then(|date_str| OffsetDateTime::parse(&date_str, &Rfc3339).ok())
-        {
+        if queue_items.is_empty() {
+            let system_status = api.get_system_status().await?;
             let mins = 2;
-            if OffsetDateTime::now_utc() < start_time + Duration::from_secs(60 * mins) {
+            if OffsetDateTime::now_utc() < system_status.start_time + Duration::from_secs(60 * mins)
+            {
                 return Ok(Vec::new());
             }
         }
 
         let queue_download_ids = queue_items
             .into_iter()
-            .filter_map(|item| item.download_id.and_then(|id| id))
+            .filter_map(|v| v.download_id)
             .map(|id| id.to_lowercase())
             .collect::<HashSet<String>>();
 
@@ -385,12 +374,12 @@ impl TorrentFilter for SonarrFilter {
 }
 
 struct RadarrFilter {
-    radarr_api: Option<Arc<RadarrAPI>>,
+    radarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
 }
 
 impl RadarrFilter {
-    fn new(radarr_api: Option<Arc<RadarrAPI>>) -> Self {
-        Self { radarr_api }
+    fn new(radarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>) -> Self {
+        Self { radarr }
     }
 }
 
@@ -401,7 +390,7 @@ impl TorrentFilter for RadarrFilter {
     }
 
     async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
-        let api = match &self.radarr_api {
+        let api = match &self.radarr {
             Some(api) => api,
             None => return Ok(torrents),
         };
@@ -413,23 +402,19 @@ impl TorrentFilter for RadarrFilter {
         trace!("Radarr Queue: {}", queue_items.len());
 
         // Ignore cleanup if Radarr has started recently
-        if queue_items.is_empty()
-            && let Some(start_time) = api
-                .get_system_status()
-                .await?
-                .start_time
-                .and_then(|date_str| OffsetDateTime::parse(&date_str, &Rfc3339).ok())
-        {
+        if queue_items.is_empty() {
+            let system_status = api.get_system_status().await?;
             let mins = 2;
-            if OffsetDateTime::now_utc() < start_time + Duration::from_secs(60 * mins) {
+            if OffsetDateTime::now_utc() < system_status.start_time + Duration::from_secs(60 * mins)
+            {
                 return Ok(Vec::new());
             }
         }
 
         let queue_download_ids = queue_items
-            .iter()
-            .filter_map(|item| item.download_id.as_ref()?.as_deref())
-            .map(str::to_lowercase)
+            .into_iter()
+            .filter_map(|v| v.download_id)
+            .map(|id| id.to_lowercase())
             .collect::<HashSet<String>>();
 
         let mut torrents = torrents;
@@ -450,18 +435,21 @@ impl TorrentFilter for RadarrFilter {
 
 pub struct CleanupController {
     cleanup_config: CleanupConfig,
-    qbit_api: Arc<Qbit>,
-    sonarr_api: Option<Arc<SonarrAPI>>,
-    radarr_api: Option<Arc<RadarrAPI>>,
+    qbittorrent: Arc<dyn QBittorrentAPIInterface>,
+    sonarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
+    radarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
 }
 
-async fn process_torrent(qbit_api: &Qbit, torrent: qbit_rs::model::Torrent) -> Result<Torrent> {
+async fn process_torrent(
+    qbit_api: &Arc<dyn QBittorrentAPIInterface>,
+    torrent: qbit_rs::model::Torrent,
+) -> Result<Torrent> {
     let name = torrent.name.context("Torrent missing name")?;
     let hash = torrent.hash.context("Torrent missing hash")?;
     let total_size = torrent.total_size.context("Torrent missing total_size")?;
     let save_path = torrent.save_path.context("Torrent missing save_path")?;
     let contents = qbit_api
-        .get_torrent_contents(&hash, None)
+        .get_torrent_contents(&hash)
         .await
         .map_err(|e| anyhow!("Could not retrieve contents for torrent '{}': {e}", name))?;
     let trackers = qbit_api
@@ -488,10 +476,8 @@ async fn process_torrent(qbit_api: &Qbit, torrent: qbit_rs::model::Torrent) -> R
     })
 }
 
-async fn get_torrents(qbit_api: Arc<Qbit>) -> Result<Vec<Torrent>> {
-    let torrent_list = qbit_api
-        .get_torrent_list(GetTorrentListArg::default())
-        .await?;
+async fn get_torrents(qbit_api: Arc<dyn QBittorrentAPIInterface>) -> Result<Vec<Torrent>> {
+    let torrent_list = qbit_api.get_torrent_list().await?;
 
     let mut set = tokio::task::JoinSet::new();
     for torrent in torrent_list {
@@ -511,44 +497,24 @@ async fn get_torrents(qbit_api: Arc<Qbit>) -> Result<Vec<Torrent>> {
 }
 
 impl CleanupController {
-    pub fn from_config(config: &ConfigData) -> Option<Self> {
-        let mut cleanup_config = config.cleanup.clone()?;
-        cleanup_config.dry_run = config.dry_run.or(cleanup_config.dry_run);
-        Self::new(
-            cleanup_config,
-            config.qbittorrent.clone(),
-            config.sonarr.clone(),
-            config.radarr.clone(),
-        )
-        .map_err(|e| warn!("Failed to initialize cleanup task: {e}"))
-        .ok()
-    }
-
     pub fn new(
         cleanup_config: CleanupConfig,
-        qbittorrent_config: QBittorrentConfig,
-        sonarr_config: Option<SonarrConfig>,
-        radarr_config: Option<RadarrConfig>,
+        qbittorrent: Option<Arc<dyn QBittorrentAPIInterface>>,
+        sonarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
+        radarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
     ) -> Result<Self> {
-        Ok(Self {
-            cleanup_config,
-            qbit_api: Arc::new(Qbit::new(
-                qbittorrent_config.host,
-                Credential::new(qbittorrent_config.username, qbittorrent_config.password),
-            )),
-            sonarr_api: sonarr_config
-                .as_ref()
-                .and_then(|c| SonarrAPI::new(c).ok())
-                .map(Arc::new),
-            radarr_api: radarr_config
-                .as_ref()
-                .and_then(|c| RadarrAPI::new(c).ok())
-                .map(Arc::new),
-        })
+        qbittorrent
+            .map(|qbittorrent| Self {
+                cleanup_config,
+                qbittorrent,
+                sonarr,
+                radarr,
+            })
+            .context("Could not initialize cleanup task")
     }
 
     async fn run(&mut self) -> Result<()> {
-        let mut torrents = get_torrents(self.qbit_api.clone()).await?;
+        let mut torrents = get_torrents(self.qbittorrent.clone()).await?;
 
         let mut filters: Vec<Box<dyn TorrentFilter>> = Vec::new();
         filters.push(Box::new(CategoriesFilter::new(
@@ -558,8 +524,8 @@ impl CleanupController {
             self.cleanup_config.ratio,
             self.cleanup_config.trackers.clone(),
         )));
-        filters.push(Box::new(SonarrFilter::new(self.sonarr_api.clone())));
-        filters.push(Box::new(RadarrFilter::new(self.radarr_api.clone())));
+        filters.push(Box::new(SonarrFilter::new(self.sonarr.clone())));
+        filters.push(Box::new(RadarrFilter::new(self.radarr.clone())));
 
         for mut filter in filters {
             debug!("Applying {filter:?} ");
@@ -588,7 +554,7 @@ impl CleanupController {
         }
 
         match self
-            .qbit_api
+            .qbittorrent
             .delete_torrents(torrent_hashes, Some(true))
             .await
         {
