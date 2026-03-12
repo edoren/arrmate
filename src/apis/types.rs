@@ -1,0 +1,63 @@
+use time::OffsetDateTime;
+
+pub type TorrentContent = qbit_rs::model::TorrentContent;
+pub type Tracker = qbit_rs::model::Tracker;
+pub type Torrent = qbit_rs::model::Torrent;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum QueueStatus {
+    Unknown,
+    Queued,
+    Paused,
+    Downloading,
+    Completed,
+    Failed,
+    Warning,
+    Delay,
+    DownloadClientUnavailable,
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum TrackedDownloadState {
+    Downloading,
+    ImportBlocked,
+    ImportPending,
+    Importing,
+    Imported,
+    FailedPending,
+    Failed,
+    Ignored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum TrackedDownloadStatus {
+    Ok,
+    Warning,
+    Error,
+}
+
+pub struct TrackedDownloadStatusMessage {
+    #[allow(unused)]
+    pub title: Option<String>,
+    pub messages: Vec<String>,
+}
+
+pub struct SystemStatus {
+    pub start_time: OffsetDateTime,
+}
+
+pub struct QueueResource {
+    pub id: i32,
+    pub added: Option<OffsetDateTime>,
+    pub size: i64,
+    pub title: Option<String>,
+    pub download_id: Option<String>,
+    pub status: QueueStatus,
+    pub tracked_download_status: TrackedDownloadStatus,
+    pub tracked_download_state: TrackedDownloadState,
+    pub status_messages: Vec<TrackedDownloadStatusMessage>,
+    // #[deprecated]
+    pub sizeleft: i64,
+    pub error_message: Option<String>,
+}

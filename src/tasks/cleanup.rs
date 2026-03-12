@@ -11,7 +11,7 @@ use tokio::fs;
 use url::Url;
 
 use crate::{
-    apis::{SonarrAndRadarrAPIInterface, qbittorrent::QBittorrentAPIInterface},
+    apis::{QBittorrentAPIInterface, SonarrAndRadarrAPIInterface},
     config::{CategoriesConfig, CleanupConfig, TrackerConfig, TrackerIgnore},
     tasks::Task,
 };

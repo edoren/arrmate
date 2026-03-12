@@ -5,20 +5,13 @@ use qbit_rs::{
     model::{Credential, GetTorrentListArg},
 };
 
-use crate::config::QBittorrentConfig;
-
-pub type TorrentContent = qbit_rs::model::TorrentContent;
-pub type Tracker = qbit_rs::model::Tracker;
-pub type Torrent = qbit_rs::model::Torrent;
-
-#[async_trait]
-pub trait QBittorrentAPIInterface: Send + Sync {
-    async fn get_torrent_list(&self) -> Result<Vec<Torrent>>;
-    async fn get_torrent_contents(&self, hash: &str) -> Result<Vec<TorrentContent>>;
-    async fn get_torrent_trackers(&self, hash: &str) -> Result<Vec<Tracker>>;
-    async fn delete_torrents(&self, hashes: Vec<String>, delete_files: Option<bool>) -> Result<()>;
-}
-
+use crate::{
+    apis::{
+        QBittorrentAPIInterface,
+        types::{Torrent, TorrentContent, Tracker},
+    },
+    config::QBittorrentConfig,
+};
 pub struct QBittorrentAPI {
     api: Qbit,
 }

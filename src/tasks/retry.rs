@@ -7,8 +7,11 @@ use time::OffsetDateTime;
 
 use crate::{
     apis::{
-        QueueResource, QueueStatus, SonarrAndRadarrAPIInterface, TrackedDownloadState,
-        TrackedDownloadStatus, TrackedDownloadStatusMessage,
+        SonarrAndRadarrAPIInterface,
+        types::{
+            QueueResource, QueueStatus, TrackedDownloadState, TrackedDownloadStatus,
+            TrackedDownloadStatusMessage,
+        },
     },
     config::RetryConfig,
     tasks::Task,

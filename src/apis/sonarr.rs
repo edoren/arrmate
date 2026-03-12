@@ -16,8 +16,11 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     apis::{
-        QueueResource, QueueStatus, SonarrAndRadarrAPIInterface, SystemStatus,
-        TrackedDownloadState, TrackedDownloadStatus, TrackedDownloadStatusMessage,
+        SonarrAndRadarrAPIInterface,
+        types::{
+            QueueResource, QueueStatus, SystemStatus, TrackedDownloadState, TrackedDownloadStatus,
+            TrackedDownloadStatusMessage,
+        },
     },
     config::SonarrConfig,
 };

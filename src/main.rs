@@ -16,7 +16,8 @@ mod tasks;
 use config::ConfigData;
 
 use crate::apis::{
-    SonarrAndRadarrAPIInterface, qbittorrent::{QBittorrentAPI, QBittorrentAPIInterface}, radarr::RadarrAPI, sonarr::SonarrAPI
+    QBittorrentAPIInterface, SonarrAndRadarrAPIInterface, qbittorrent::QBittorrentAPI,
+    radarr::RadarrAPI, sonarr::SonarrAPI,
 };
 
 async fn get_config() -> Result<ConfigData> {
