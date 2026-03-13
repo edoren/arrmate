@@ -685,3 +685,489 @@ impl Task for CleanupController {
         self.run().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apis::types::{
+        QueueResource, QueueStatus, SystemStatus, TrackedDownloadState, TrackedDownloadStatus,
+    };
+    use qbit_rs::model::{Tracker, TrackerStatus};
+    use time::OffsetDateTime;
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    fn make_torrent(name: &str, hash: &str) -> Torrent {
+        Torrent {
+            name: name.to_string(),
+            hash: hash.to_string(),
+            total_size: 1_000_000,
+            save_path: "/downloads".to_string(),
+            category: String::new(),
+            ratio: 0.0,
+            seeding_time: Duration::from_secs(0),
+            progress: 0.0,
+            last_activity: None,
+            trackers: vec![],
+            contents: vec![],
+        }
+    }
+
+    fn make_tracker_url(url: &str) -> Tracker {
+        Tracker {
+            url: url.to_string(),
+            status: TrackerStatus::Working,
+            tier: 0,
+            num_peers: 0,
+            num_seeds: 0,
+            num_leeches: 0,
+            num_downloaded: 0,
+            msg: String::new(),
+        }
+    }
+
+    fn make_queue_resource(download_id: Option<&str>) -> QueueResource {
+        QueueResource {
+            id: 1,
+            added: None,
+            size: 1_000_000,
+            title: Some("title".to_string()),
+            download_id: download_id.map(|s| s.to_string()),
+            status: QueueStatus::Downloading,
+            tracked_download_status: TrackedDownloadStatus::Ok,
+            tracked_download_state: TrackedDownloadState::Downloading,
+            status_messages: vec![],
+            sizeleft: 0,
+            error_message: None,
+        }
+    }
+
+    fn make_tracker_config(
+        domain: &str,
+        ratio: Option<f64>,
+        seeding_time: Option<Duration>,
+        require_both: bool,
+        ignore: Option<TrackerIgnore>,
+    ) -> TrackerConfig {
+        TrackerConfig {
+            name: domain.to_string(),
+            domain: vec![domain.to_string()],
+            ratio,
+            seeding_time,
+            require_both,
+            hard_links_percentage: 100,
+            ignore,
+        }
+    }
+
+    fn torrent_with_tracker(url: &str) -> Torrent {
+        let mut t = make_torrent("t", "abc");
+        t.trackers = vec![make_tracker_url(url)];
+        t
+    }
+
+    struct MockArrApi {
+        queue: Vec<QueueResource>,
+        system_status: SystemStatus,
+    }
+
+    impl MockArrApi {
+        fn with_queue(queue: Vec<QueueResource>) -> Self {
+            Self {
+                queue,
+                system_status: SystemStatus {
+                    start_time: OffsetDateTime::now_utc() - Duration::from_secs(3600),
+                },
+            }
+        }
+
+        fn started_recently(queue: Vec<QueueResource>) -> Self {
+            Self {
+                queue,
+                system_status: SystemStatus {
+                    start_time: OffsetDateTime::now_utc(),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SonarrAndRadarrAPIInterface for MockArrApi {
+        async fn get_system_status(&self) -> Result<SystemStatus> {
+            Ok(self.system_status.clone())
+        }
+
+        async fn get_queue(&self) -> Result<Vec<QueueResource>> {
+            Ok(self.queue.clone())
+        }
+
+        async fn queue_bulk_delete(
+            &self,
+            _ids: Vec<i32>,
+            _remove_from_client: Option<bool>,
+            _blocklist: Option<bool>,
+            _skip_redownload: Option<bool>,
+            _change_category: Option<bool>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // ── CategoriesFilter ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn categories_filter_no_config_passes() {
+        let mut f = CategoriesFilter::new(None);
+        let t = make_torrent("t", "abc");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn categories_filter_matching_ignored_category_is_ignored() {
+        let mut f = CategoriesFilter::new(Some(vec![CategoriesConfig {
+            name: "movies".to_string(),
+            ignore: true,
+        }]));
+        let mut t = make_torrent("t", "abc");
+        t.category = "movies".to_string();
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+        assert!(!result.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn categories_filter_non_ignored_category_passes() {
+        let mut f = CategoriesFilter::new(Some(vec![CategoriesConfig {
+            name: "movies".to_string(),
+            ignore: false,
+        }]));
+        let mut t = make_torrent("t", "abc");
+        t.category = "movies".to_string();
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn categories_filter_non_matching_category_passes() {
+        let mut f = CategoriesFilter::new(Some(vec![CategoriesConfig {
+            name: "movies".to_string(),
+            ignore: true,
+        }]));
+        let mut t = make_torrent("t", "abc");
+        t.category = "tv".to_string();
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    // ── TrackerFilter ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tracker_filter_no_config_passes() {
+        let mut f = TrackerFilter::new(None, None);
+        let t = make_torrent("t", "abc");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_global_ratio_not_met_is_ignored() {
+        // Global ratio only checked when trackers are configured but none match
+        let cfg = make_tracker_config(
+            "other.example.com",
+            None,
+            None,
+            false,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(Some(2.0), Some(vec![cfg]));
+        let mut t = make_torrent("t", "abc");
+        t.ratio = 1.0;
+        // No trackers on the torrent → configured_trackers is empty → global ratio applies
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_global_ratio_met_equal_passes() {
+        let cfg = make_tracker_config(
+            "other.example.com",
+            None,
+            None,
+            false,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(Some(2.0), Some(vec![cfg]));
+        let mut t = make_torrent("t", "abc");
+        t.ratio = 2.5;
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_global_ratio_met_higher_passes() {
+        let cfg = make_tracker_config(
+            "other.example.com",
+            None,
+            None,
+            false,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(Some(2.0), Some(vec![cfg]));
+        let mut t = make_torrent("t", "abc");
+        t.ratio = 2.5;
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_ignore_always_is_ignored() {
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            None,
+            None,
+            false,
+            Some(TrackerIgnore::Always),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let t = torrent_with_tracker("https://tracker.example.com/announce");
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_ignore_never_passes() {
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            None,
+            None,
+            false,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let t = torrent_with_tracker("https://tracker.example.com/announce");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_ratio_not_met_is_ignored() {
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            Some(2.0),
+            None,
+            false,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.ratio = 1.0;
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_ratio_met_passes() {
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            Some(2.0),
+            None,
+            false,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.ratio = 3.0;
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_seeding_time_not_met_is_ignored() {
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            None,
+            Some(Duration::from_secs(3600)),
+            false,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.seeding_time = Duration::from_secs(60);
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_seeding_time_met_passes() {
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            None,
+            Some(Duration::from_secs(3600)),
+            false,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.seeding_time = Duration::from_secs(7200);
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_require_both_only_ratio_met_is_ignored() {
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            Some(2.0),
+            Some(Duration::from_secs(3600)),
+            true,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.ratio = 3.0;
+        t.seeding_time = Duration::from_secs(60);
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_require_both_both_met_passes() {
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            Some(2.0),
+            Some(Duration::from_secs(3600)),
+            true,
+            Some(TrackerIgnore::Never),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.ratio = 3.0;
+        t.seeding_time = Duration::from_secs(7200);
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_no_matching_tracker_passes() {
+        let cfg = make_tracker_config(
+            "other.example.com",
+            None,
+            None,
+            false,
+            Some(TrackerIgnore::Always),
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let t = torrent_with_tracker("https://tracker.example.com/announce");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    // ── SonarrFilter ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sonarr_filter_no_api_passes() {
+        let mut f = SonarrFilter::new(None);
+        let t = make_torrent("t", "abc");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn sonarr_filter_torrent_in_queue_is_ignored() {
+        let api: Arc<dyn SonarrAndRadarrAPIInterface> =
+            Arc::new(MockArrApi::with_queue(vec![make_queue_resource(Some(
+                "ABC123",
+            ))]));
+        let mut f = SonarrFilter::new(Some(api));
+        let mut t = make_torrent("t", "ABC123");
+        t.hash = "ABC123".to_string();
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+    }
+
+    #[tokio::test]
+    async fn sonarr_filter_torrent_not_in_queue_passes() {
+        let api: Arc<dyn SonarrAndRadarrAPIInterface> =
+            Arc::new(MockArrApi::with_queue(vec![make_queue_resource(Some(
+                "OTHER",
+            ))]));
+        let mut f = SonarrFilter::new(Some(api));
+        let t = make_torrent("t", "ABC123");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn sonarr_filter_empty_queue_recently_started_bails() {
+        let api: Arc<dyn SonarrAndRadarrAPIInterface> =
+            Arc::new(MockArrApi::started_recently(vec![]));
+        let mut f = SonarrFilter::new(Some(api));
+        let t = make_torrent("t", "abc");
+        let result = f.filter(&t).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn sonarr_filter_empty_queue_started_long_ago_passes() {
+        let api: Arc<dyn SonarrAndRadarrAPIInterface> = Arc::new(MockArrApi::with_queue(vec![]));
+        let mut f = SonarrFilter::new(Some(api));
+        let t = make_torrent("t", "abc");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    // ── RadarrFilter ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn radarr_filter_no_api_passes() {
+        let mut f = RadarrFilter::new(None);
+        let t = make_torrent("t", "abc");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn radarr_filter_torrent_in_queue_is_ignored() {
+        let api: Arc<dyn SonarrAndRadarrAPIInterface> =
+            Arc::new(MockArrApi::with_queue(vec![make_queue_resource(Some(
+                "ABC123",
+            ))]));
+        let mut f = RadarrFilter::new(Some(api));
+        let mut t = make_torrent("t", "ABC123");
+        t.hash = "ABC123".to_string();
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+    }
+
+    #[tokio::test]
+    async fn radarr_filter_torrent_not_in_queue_passes() {
+        let api: Arc<dyn SonarrAndRadarrAPIInterface> =
+            Arc::new(MockArrApi::with_queue(vec![make_queue_resource(Some(
+                "OTHER",
+            ))]));
+        let mut f = RadarrFilter::new(Some(api));
+        let t = make_torrent("t", "ABC123");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn radarr_filter_empty_queue_recently_started_bails() {
+        let api: Arc<dyn SonarrAndRadarrAPIInterface> =
+            Arc::new(MockArrApi::started_recently(vec![]));
+        let mut f = RadarrFilter::new(Some(api));
+        let t = make_torrent("t", "abc");
+        let result = f.filter(&t).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn radarr_filter_empty_queue_started_long_ago_passes() {
+        let api: Arc<dyn SonarrAndRadarrAPIInterface> = Arc::new(MockArrApi::with_queue(vec![]));
+        let mut f = RadarrFilter::new(Some(api));
+        let t = make_torrent("t", "abc");
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+}
