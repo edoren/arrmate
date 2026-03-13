@@ -1,9 +1,5 @@
 use time::OffsetDateTime;
 
-pub type TorrentContent = qbit_rs::model::TorrentContent;
-pub type Tracker = qbit_rs::model::Tracker;
-pub type Torrent = qbit_rs::model::Torrent;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum QueueStatus {
     Unknown,

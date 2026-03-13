@@ -8,10 +8,8 @@ pub mod types;
 
 #[async_trait]
 pub trait QBittorrentAPIInterface: Send + Sync {
-    async fn get_torrent_list(&self) -> Result<Vec<types::Torrent>>;
-    async fn get_torrent_contents(&self, hash: &str) -> Result<Vec<types::TorrentContent>>;
-    async fn get_torrent_trackers(&self, hash: &str) -> Result<Vec<types::Tracker>>;
-    async fn delete_torrents(&self, hashes: Vec<String>, delete_files: Option<bool>) -> Result<()>;
+    async fn get_torrent_list(&self) -> Result<Vec<qbittorrent::Torrent>>;
+    async fn delete_torrents(&self, torrents: Vec<&qbittorrent::Torrent>, delete_files: Option<bool>) -> Result<()>;
 }
 
 #[async_trait]

@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt::Debug,
     ops::AddAssign,
     os::linux::fs::MetadataExt,
     path::Path,
@@ -18,6 +17,7 @@ use url::Url;
 use crate::{
     apis::{
         QBittorrentAPIInterface, SonarrAndRadarrAPIInterface,
+        qbittorrent::Torrent,
         types::{QueueResource, SystemStatus},
     },
     config::{CategoriesConfig, CleanupConfig, TrackerConfig, TrackerIgnore},
@@ -29,37 +29,6 @@ static VIDEO_EXTENSIONS: [&str; 38] = [
     "yuv", "rm", "asf", "amv", "mp4", "m4p", "m4v", "mpg", "mp2", "mpeg", "mpe", "mpv", "m4v",
     "svi", "3gp", "3g2", "mxf", "roq", "nsv", "flv", "f4v", "f4p", "f4a", "f4b", "mod",
 ];
-
-#[derive(Clone, Debug)]
-struct Torrent {
-    name: String,
-    hash: String,
-    #[allow(unused)]
-    total_size: i64,
-    save_path: String,
-    category: String,
-    ratio: f64,
-    seeding_time: Duration,
-    progress: f64,
-    #[allow(unused)]
-    last_activity: Option<OffsetDateTime>,
-    trackers: Vec<qbit_rs::model::Tracker>,
-    contents: Vec<qbit_rs::model::TorrentContent>,
-}
-
-impl std::cmp::PartialEq for Torrent {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
-    }
-}
-
-impl std::cmp::Eq for Torrent {}
-
-impl std::hash::Hash for Torrent {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
-    }
-}
 
 struct TorrentFilterData {
     ignored: bool,
@@ -104,12 +73,6 @@ impl AddAssign for TorrentFilterData {
 trait TorrentFilter: Send {
     fn name(&self) -> String;
     async fn filter(&mut self, torrent: &Torrent) -> Result<TorrentFilterData>;
-}
-
-impl Debug for dyn TorrentFilter {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.name())
-    }
 }
 
 struct CategoriesFilter {
@@ -410,12 +373,6 @@ impl TorrentFilter for SonarrFilter {
             .map(|id| id.to_lowercase())
             .collect::<HashSet<String>>();
 
-        // trace!(
-        //     "Sonarr Torrents: {:?}",
-        //     torrents.iter().map(|t| &t.name).collect::<Vec<&String>>()
-        // );
-        // trace!("Sonarr Download Ids: {:?}", queue_download_ids);
-
         if queue_download_ids.contains(&torrent.hash.to_lowercase()) {
             return Ok(TorrentFilterData::ignored_single_message(format!(
                 "Ignoring torrent '{}' due to still present on Sonarr queue",
@@ -524,62 +481,6 @@ pub struct CleanupController {
     radarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
 }
 
-async fn process_torrent(
-    qbit_api: &Arc<dyn QBittorrentAPIInterface>,
-    torrent: qbit_rs::model::Torrent,
-) -> Result<Torrent> {
-    let name = torrent.name.context("Torrent missing name")?;
-    let hash = torrent.hash.context("Torrent missing hash")?;
-    let total_size = torrent.total_size.context("Torrent missing total_size")?;
-    let save_path = torrent.save_path.context("Torrent missing save_path")?;
-    let contents = qbit_api
-        .get_torrent_contents(&hash)
-        .await
-        .map_err(|e| anyhow!("Could not retrieve contents for torrent '{}': {e}", name))?;
-    let trackers = qbit_api
-        .get_torrent_trackers(&hash)
-        .await
-        .map_err(|e| anyhow!("Could not retrieve trackers for torrent '{}': {e}", name))?;
-
-    Ok(Torrent {
-        name,
-        hash,
-        total_size,
-        save_path,
-        category: torrent.category.unwrap_or_default(),
-        ratio: torrent.ratio.unwrap_or(0.0),
-        seeding_time: Duration::from_secs(
-            torrent.seeding_time.unwrap_or(0).try_into().unwrap_or(0),
-        ),
-        progress: torrent.progress.unwrap_or(0.0),
-        last_activity: torrent
-            .last_activity
-            .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok()),
-        trackers,
-        contents,
-    })
-}
-
-async fn get_torrents(qbit_api: Arc<dyn QBittorrentAPIInterface>) -> Result<Vec<Torrent>> {
-    let torrent_list = qbit_api.get_torrent_list().await?;
-
-    let mut set = tokio::task::JoinSet::new();
-    for torrent in torrent_list {
-        let qbit_api = qbit_api.clone();
-        set.spawn(async move { process_torrent(&qbit_api, torrent).await });
-    }
-
-    let mut results = Vec::new();
-    while let Some(join_result) = set.join_next().await {
-        match join_result {
-            Ok(Ok(torrent)) => results.push(torrent),
-            Ok(Err(e)) => error!("Failed to process torrent: {e}"),
-            Err(e) => error!("Torrent processing task panicked: {e}"),
-        }
-    }
-    Ok(results)
-}
-
 impl CleanupController {
     pub fn new(
         cleanup_config: CleanupConfig,
@@ -597,8 +498,55 @@ impl CleanupController {
             .context("Could not initialize cleanup task")
     }
 
+    async fn delete_torrents(&self, torrents: Vec<&Torrent>) -> Result<usize> {
+        if torrents.is_empty() {
+            return Ok(0);
+        }
+
+        if self.cleanup_config.dry_run.unwrap_or(false) {
+            return Ok(0);
+        }
+
+        let torrents_size: usize = torrents.len();
+        self.qbittorrent
+            .delete_torrents(torrents, Some(true))
+            .await?;
+
+        Ok(torrents_size)
+    }
+
+    async fn process_with_filters(
+        &self,
+        torrents: Vec<Torrent>,
+        mut filters: Vec<Box<dyn TorrentFilter>>,
+    ) -> Result<HashMap<Torrent, TorrentFilterData>> {
+        let mut processed_torrents = HashMap::new();
+
+        for torrent in torrents {
+            processed_torrents.insert(torrent, TorrentFilterData::pass());
+        }
+
+        for filter in &mut filters {
+            debug!("Applying filter {}", filter.name());
+            for (torrent, filter_data) in &mut processed_torrents {
+                debug!("Evaluating torrent '{}'", torrent.name);
+                if let Ok(data) = filter.filter(&torrent).await {
+                    *filter_data += data;
+                } else {
+                    error!(
+                        "Filter '{}' failed for torrent '{}', ignoring",
+                        filter.name(),
+                        torrent.name
+                    );
+                }
+            }
+        }
+
+        return Ok(processed_torrents);
+    }
+
     async fn run(&mut self) -> Result<()> {
-        let torrents = get_torrents(self.qbittorrent.clone()).await?;
+        let torrents = self.qbittorrent.get_torrent_list().await?;
 
         let mut filters: Vec<Box<dyn TorrentFilter>> = Vec::new();
         filters.push(Box::new(CategoriesFilter::new(
@@ -611,64 +559,28 @@ impl CleanupController {
         filters.push(Box::new(SonarrFilter::new(self.sonarr.clone())));
         filters.push(Box::new(RadarrFilter::new(self.radarr.clone())));
 
-        let mut processed_torrents = HashMap::new();
-        let mut torrents_to_delete = HashMap::new();
-        let mut torrents_ignored = HashMap::new();
-        for filter in &mut filters {
-            debug!("Applying filter {}", filter.name());
-            for torrent in &torrents {
-                debug!("Evaluating torrent '{}'", torrent.name);
-                let torrent_entry = processed_torrents
-                    .entry(torrent)
-                    .or_insert_with(TorrentFilterData::pass);
-                if let Ok(data) = filter.filter(&torrent).await {
-                    *torrent_entry += data;
-                } else {
-                    error!(
-                        "Filter '{}' failed for torrent '{}', ignoring filter result: {}",
-                        filter.name(),
-                        torrent.name,
-                        anyhow!("Filter error").to_string()
-                    );
-                }
-            }
-        }
+        let processed_torrents = self.process_with_filters(torrents, filters).await?;
 
+        let mut torrents_to_delete = Vec::new();
+        let mut torrents_ignored = HashMap::new();
         for (torrent, filter_data) in processed_torrents {
             if filter_data.ignored {
                 torrents_ignored.insert(torrent, filter_data.messages);
             } else {
-                torrents_to_delete.insert(torrent, filter_data.messages);
+                torrents_to_delete.push(torrent);
             }
         }
 
-        if torrents_to_delete.is_empty() {
-            trace!("No torrents to delete");
-            return Ok(());
-        }
-
-        info!("The following torrents will be deleted:");
-        for (torrent, _) in &torrents_to_delete {
-            info!("- {}", torrent.name);
-        }
-
-        let torrent_hashes = torrents_to_delete
-            .iter()
-            .map(|(torrent, _)| torrent.hash.clone())
-            .collect::<Vec<String>>();
-
-        if self.cleanup_config.dry_run.unwrap_or(false) {
-            info!("Dry run enabled, not deleting torrents");
-            return Ok(());
-        }
-
-        match self
-            .qbittorrent
-            .delete_torrents(torrent_hashes, Some(true))
+        let deleted_count = self
+            .delete_torrents(torrents_to_delete.iter().collect())
             .await
-        {
-            Ok(_) => info!("Torrents deleted"),
-            Err(_) => info!("Failed to delete torrents"),
+            .map_err(|e| anyhow!("Failed to delete torrents: {}", e))?;
+
+        info!("Deleted {} torrents", deleted_count);
+
+        info!("The following torrents were deleted:");
+        for torrent in &torrents_to_delete {
+            info!("- {}", torrent.name);
         }
 
         Ok(())
@@ -695,7 +607,7 @@ mod tests {
     use qbit_rs::model::{Tracker, TrackerStatus};
     use time::OffsetDateTime;
 
-    // ── helpers ─────────────────────────────────────────────────────────────
+    // ── helpers ──────────────────────────────────────────────────────────────
 
     fn make_torrent(name: &str, hash: &str) -> Torrent {
         Torrent {
@@ -766,6 +678,89 @@ mod tests {
         t
     }
 
+    fn make_controller(
+        qbit: Arc<dyn QBittorrentAPIInterface>,
+        dry_run: Option<bool>,
+    ) -> CleanupController {
+        CleanupController {
+            cleanup_config: CleanupConfig {
+                ratio: None,
+                trackers: None,
+                categories: None,
+                dry_run,
+            },
+            qbittorrent: qbit,
+            sonarr: None,
+            radarr: None,
+        }
+    }
+
+    fn make_run_controller(mock: Arc<MockQBitApi>, dry_run: Option<bool>) -> CleanupController {
+        CleanupController {
+            cleanup_config: CleanupConfig {
+                ratio: None,
+                trackers: None,
+                categories: None,
+                dry_run,
+            },
+            qbittorrent: mock,
+            sonarr: None,
+            radarr: None,
+        }
+    }
+
+    fn make_content(name: &str, size: u64) -> qbit_rs::model::TorrentContent {
+        qbit_rs::model::TorrentContent {
+            index: 0,
+            name: name.to_string(),
+            size,
+            progress: 1.0,
+            priority: qbit_rs::model::Priority::Normal,
+            is_seed: Some(true),
+            piece_range: vec![],
+            availability: 1.0,
+        }
+    }
+
+    // ── mocks ────────────────────────────────────────────────────────────────
+
+    struct AlwaysPassFilter;
+    struct AlwaysIgnoreFilter;
+    struct AlwaysErrFilter;
+
+    #[async_trait]
+    impl TorrentFilter for AlwaysPassFilter {
+        fn name(&self) -> String {
+            "AlwaysPassFilter".to_string()
+        }
+        async fn filter(&mut self, _torrent: &Torrent) -> Result<TorrentFilterData> {
+            Ok(TorrentFilterData::pass())
+        }
+    }
+
+    #[async_trait]
+    impl TorrentFilter for AlwaysIgnoreFilter {
+        fn name(&self) -> String {
+            "AlwaysIgnoreFilter".to_string()
+        }
+        async fn filter(&mut self, torrent: &Torrent) -> Result<TorrentFilterData> {
+            Ok(TorrentFilterData::ignored_single_message(format!(
+                "ignoring '{}'",
+                torrent.name
+            )))
+        }
+    }
+
+    #[async_trait]
+    impl TorrentFilter for AlwaysErrFilter {
+        fn name(&self) -> String {
+            "AlwaysErrFilter".to_string()
+        }
+        async fn filter(&mut self, _torrent: &Torrent) -> Result<TorrentFilterData> {
+            Err(anyhow::anyhow!("filter error"))
+        }
+    }
+
     struct MockArrApi {
         queue: Vec<QueueResource>,
         system_status: SystemStatus,
@@ -813,7 +808,114 @@ mod tests {
         }
     }
 
-    // ── CategoriesFilter ────────────────────────────────────────────────────
+    struct MockQBitApi {
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+        delete_result: bool,
+        torrent_list: Vec<Torrent>,
+    }
+
+    impl MockQBitApi {
+        fn new() -> Self {
+            Self {
+                deleted: Arc::new(std::sync::Mutex::new(vec![])),
+                delete_result: true,
+                torrent_list: vec![],
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                deleted: Arc::new(std::sync::Mutex::new(vec![])),
+                delete_result: false,
+                torrent_list: vec![],
+            }
+        }
+
+        fn with_torrents(torrents: Vec<Torrent>) -> Self {
+            Self {
+                deleted: Arc::new(std::sync::Mutex::new(vec![])),
+                delete_result: true,
+                torrent_list: torrents,
+            }
+        }
+
+        fn deleted_hashes(&self) -> Vec<String> {
+            self.deleted.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl QBittorrentAPIInterface for MockQBitApi {
+        async fn get_torrent_list(&self) -> Result<Vec<Torrent>> {
+            Ok(self.torrent_list.clone())
+        }
+
+        async fn delete_torrents(
+            &self,
+            torrents: Vec<&Torrent>,
+            _delete_files: Option<bool>,
+        ) -> Result<()> {
+            let mut deleted = self.deleted.lock().unwrap();
+            deleted.extend(torrents.iter().map(|t| t.hash.clone()));
+            if self.delete_result {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("delete failed"))
+            }
+        }
+    }
+
+    struct MockArrApiCounted {
+        queue: Vec<QueueResource>,
+        system_status: SystemStatus,
+        queue_calls: Arc<std::sync::Mutex<usize>>,
+        status_calls: Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl MockArrApiCounted {
+        fn new(queue: Vec<QueueResource>, system_status: SystemStatus) -> Self {
+            Self {
+                queue,
+                system_status,
+                queue_calls: Arc::new(std::sync::Mutex::new(0)),
+                status_calls: Arc::new(std::sync::Mutex::new(0)),
+            }
+        }
+
+        fn queue_call_count(&self) -> usize {
+            *self.queue_calls.lock().unwrap()
+        }
+
+        fn status_call_count(&self) -> usize {
+            *self.status_calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl SonarrAndRadarrAPIInterface for MockArrApiCounted {
+        async fn get_system_status(&self) -> Result<SystemStatus> {
+            *self.status_calls.lock().unwrap() += 1;
+            Ok(self.system_status.clone())
+        }
+
+        async fn get_queue(&self) -> Result<Vec<QueueResource>> {
+            *self.queue_calls.lock().unwrap() += 1;
+            Ok(self.queue.clone())
+        }
+
+        async fn queue_bulk_delete(
+            &self,
+            _ids: Vec<i32>,
+            _remove_from_client: Option<bool>,
+            _blocklist: Option<bool>,
+            _skip_redownload: Option<bool>,
+            _change_category: Option<bool>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // ── CategoriesFilter ─────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn categories_filter_no_config_passes() {
@@ -858,6 +960,11 @@ mod tests {
         t.category = "tv".to_string();
         let result = f.filter(&t).await.unwrap();
         assert!(!result.ignored);
+    }
+
+    #[test]
+    fn categories_filter_name() {
+        assert_eq!(CategoriesFilter::new(None).name(), "CategoriesFilter");
     }
 
     // ── TrackerFilter ────────────────────────────────────────────────────────
@@ -1063,7 +1170,77 @@ mod tests {
         assert!(!result.ignored);
     }
 
-    // ── SonarrFilter ────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn tracker_filter_when_hard_linked_ignored_when_percentage_met() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orig = dir.path().join("movie.mkv");
+        std::fs::write(&orig, b"data").expect("write");
+        let link = dir.path().join("movie_link.mkv");
+        std::fs::hard_link(&orig, &link).expect("hard_link");
+
+        let save_path = dir.path().to_str().unwrap().to_string();
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            None,
+            None,
+            false,
+            None, // defaults to WhenHardLinked
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.progress = 1.0;
+        t.save_path = save_path;
+        t.contents = vec![make_content("movie.mkv", 4)];
+
+        let result = f.filter(&t).await.unwrap();
+        assert!(result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_when_hard_linked_passes_when_no_hard_links() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("movie.mkv");
+        std::fs::write(&file, b"data").expect("write");
+
+        let save_path = dir.path().to_str().unwrap().to_string();
+        let cfg = make_tracker_config(
+            "tracker.example.com",
+            None,
+            None,
+            false,
+            None, // defaults to WhenHardLinked
+        );
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.progress = 1.0;
+        t.save_path = save_path;
+        t.contents = vec![make_content("movie.mkv", 4)];
+
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn tracker_filter_missing_content_file_skipped_gracefully() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let save_path = dir.path().to_str().unwrap().to_string();
+        let cfg = make_tracker_config("tracker.example.com", None, None, false, None);
+        let mut f = TrackerFilter::new(None, Some(vec![cfg]));
+        let mut t = torrent_with_tracker("https://tracker.example.com/announce");
+        t.progress = 1.0;
+        t.save_path = save_path;
+        // file does not exist → metadata Err → continue; 0% hard-linked → not ignored
+        t.contents = vec![make_content("nonexistent.mkv", 1000)];
+        let result = f.filter(&t).await.unwrap();
+        assert!(!result.ignored);
+    }
+
+    #[test]
+    fn tracker_filter_name() {
+        assert_eq!(TrackerFilter::new(None, None).name(), "TrackerFilter");
+    }
+
+    // ── SonarrFilter ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn sonarr_filter_no_api_passes() {
@@ -1117,7 +1294,69 @@ mod tests {
         assert!(!result.ignored);
     }
 
-    // ── RadarrFilter ────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn sonarr_filter_queue_cached_on_second_call() {
+        let api = Arc::new(MockArrApiCounted::new(
+            vec![make_queue_resource(Some("ABC"))],
+            SystemStatus {
+                start_time: OffsetDateTime::now_utc() - Duration::from_secs(3600),
+            },
+        ));
+        let api_dyn = api.clone() as Arc<dyn SonarrAndRadarrAPIInterface>;
+        let mut f = SonarrFilter::new(Some(api_dyn));
+        let t = make_torrent("t", "xyz");
+        let _ = f.filter(&t).await;
+        let _ = f.filter(&t).await;
+        assert_eq!(api.queue_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn sonarr_filter_system_status_cached_on_second_call() {
+        // Empty queue triggers system_status fetch; started recently → Err
+        let api = Arc::new(MockArrApiCounted::new(
+            vec![],
+            SystemStatus {
+                start_time: OffsetDateTime::now_utc(),
+            },
+        ));
+        let api_dyn = api.clone() as Arc<dyn SonarrAndRadarrAPIInterface>;
+        let mut f = SonarrFilter::new(Some(api_dyn));
+        let t = make_torrent("t", "xyz");
+        let _ = f.filter(&t).await; // fetches queue + status
+        let _ = f.filter(&t).await; // both from cache
+        assert_eq!(api.queue_call_count(), 1);
+        assert_eq!(api.status_call_count(), 1);
+    }
+
+    #[test]
+    fn sonarr_filter_name() {
+        assert_eq!(SonarrFilter::new(None).name(), "SonarrFilter");
+    }
+
+    // These branches are structurally unreachable via filter() (which guards
+    // sonarr.is_none() first), but reachable by calling the private methods
+    // directly from within this module.
+    #[tokio::test]
+    async fn sonarr_filter_get_queue_no_api_bails() {
+        let mut f = SonarrFilter {
+            sonarr: None,
+            cached_queue: None,
+            cached_system_status: None,
+        };
+        assert!(f.get_queue().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sonarr_filter_get_system_status_no_api_bails() {
+        let mut f = SonarrFilter {
+            sonarr: None,
+            cached_queue: None,
+            cached_system_status: None,
+        };
+        assert!(f.get_system_status().await.is_err());
+    }
+
+    // ── RadarrFilter ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn radarr_filter_no_api_passes() {
@@ -1169,5 +1408,273 @@ mod tests {
         let t = make_torrent("t", "abc");
         let result = f.filter(&t).await.unwrap();
         assert!(!result.ignored);
+    }
+
+    #[tokio::test]
+    async fn radarr_filter_queue_cached_on_second_call() {
+        let api = Arc::new(MockArrApiCounted::new(
+            vec![make_queue_resource(Some("ABC"))],
+            SystemStatus {
+                start_time: OffsetDateTime::now_utc() - Duration::from_secs(3600),
+            },
+        ));
+        let api_dyn = api.clone() as Arc<dyn SonarrAndRadarrAPIInterface>;
+        let mut f = RadarrFilter::new(Some(api_dyn));
+        let t = make_torrent("t", "xyz");
+        let _ = f.filter(&t).await;
+        let _ = f.filter(&t).await;
+        assert_eq!(api.queue_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn radarr_filter_system_status_cached_on_second_call() {
+        let api = Arc::new(MockArrApiCounted::new(
+            vec![],
+            SystemStatus {
+                start_time: OffsetDateTime::now_utc(),
+            },
+        ));
+        let api_dyn = api.clone() as Arc<dyn SonarrAndRadarrAPIInterface>;
+        let mut f = RadarrFilter::new(Some(api_dyn));
+        let t = make_torrent("t", "xyz");
+        let _ = f.filter(&t).await;
+        let _ = f.filter(&t).await;
+        assert_eq!(api.queue_call_count(), 1);
+        assert_eq!(api.status_call_count(), 1);
+    }
+
+    #[test]
+    fn radarr_filter_name() {
+        assert_eq!(RadarrFilter::new(None).name(), "RadarrFilter");
+    }
+
+    // These branches are structurally unreachable via filter() (which guards
+    // radarr.is_none() first), but reachable by calling the private methods
+    // directly from within this module.
+    #[tokio::test]
+    async fn radarr_filter_get_queue_no_api_bails() {
+        let mut f = RadarrFilter {
+            radarr: None,
+            cached_queue: None,
+            cached_system_status: None,
+        };
+        assert!(f.get_queue().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn radarr_filter_get_system_status_no_api_bails() {
+        let mut f = RadarrFilter {
+            radarr: None,
+            cached_queue: None,
+            cached_system_status: None,
+        };
+        assert!(f.get_system_status().await.is_err());
+    }
+
+    // ── delete_torrents ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_torrents_empty_returns_zero_without_calling_api() {
+        let mock = Arc::new(MockQBitApi::new());
+        let ctrl = make_controller(mock.clone(), None);
+        let count = ctrl.delete_torrents(vec![]).await.unwrap();
+        assert_eq!(count, 0);
+        assert!(mock.deleted_hashes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_torrents_dry_run_returns_zero_without_calling_api() {
+        let mock = Arc::new(MockQBitApi::new());
+        let ctrl = make_controller(mock.clone(), Some(true));
+        let t = make_torrent("t", "abc");
+        let count = ctrl.delete_torrents(vec![&t]).await.unwrap();
+        assert_eq!(count, 0);
+        assert!(mock.deleted_hashes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_torrents_calls_api_and_returns_count() {
+        let mock = Arc::new(MockQBitApi::new());
+        let ctrl = make_controller(mock.clone(), None);
+        let t1 = make_torrent("a", "hash1");
+        let t2 = make_torrent("b", "hash2");
+        let count = ctrl.delete_torrents(vec![&t1, &t2]).await.unwrap();
+        assert_eq!(count, 2);
+        let deleted = mock.deleted_hashes();
+        assert!(deleted.contains(&"hash1".to_string()));
+        assert!(deleted.contains(&"hash2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn delete_torrents_api_error_propagates() {
+        let mock = Arc::new(MockQBitApi::failing());
+        let ctrl = make_controller(mock.clone(), None);
+        let t = make_torrent("t", "abc");
+        assert!(ctrl.delete_torrents(vec![&t]).await.is_err());
+    }
+
+    // ── process_with_filters ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn process_with_filters_no_filters_all_pass() {
+        let ctrl = make_controller(Arc::new(MockQBitApi::new()), None);
+        let torrents = vec![make_torrent("a", "h1"), make_torrent("b", "h2")];
+        let result = ctrl.process_with_filters(torrents, vec![]).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.values().all(|d| !d.ignored));
+    }
+
+    #[tokio::test]
+    async fn process_with_filters_ignore_filter_marks_all_ignored() {
+        let ctrl = make_controller(Arc::new(MockQBitApi::new()), None);
+        let torrents = vec![make_torrent("a", "h1"), make_torrent("b", "h2")];
+        let filters: Vec<Box<dyn TorrentFilter>> = vec![Box::new(AlwaysIgnoreFilter)];
+        let result = ctrl.process_with_filters(torrents, filters).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.values().all(|d| d.ignored));
+    }
+
+    #[tokio::test]
+    async fn process_with_filters_pass_filter_leaves_none_ignored() {
+        let ctrl = make_controller(Arc::new(MockQBitApi::new()), None);
+        let torrents = vec![make_torrent("a", "h1")];
+        let filters: Vec<Box<dyn TorrentFilter>> = vec![Box::new(AlwaysPassFilter)];
+        let result = ctrl.process_with_filters(torrents, filters).await.unwrap();
+        assert!(!result.values().next().unwrap().ignored);
+    }
+
+    #[tokio::test]
+    async fn process_with_filters_failing_filter_does_not_ignore() {
+        let ctrl = make_controller(Arc::new(MockQBitApi::new()), None);
+        let torrents = vec![make_torrent("a", "h1")];
+        let filters: Vec<Box<dyn TorrentFilter>> = vec![Box::new(AlwaysErrFilter)];
+        let result = ctrl.process_with_filters(torrents, filters).await.unwrap();
+        // Error from filter is swallowed; torrent should not be marked ignored
+        assert!(!result.values().next().unwrap().ignored);
+    }
+
+    #[tokio::test]
+    async fn process_with_filters_multiple_filters_combined() {
+        let ctrl = make_controller(Arc::new(MockQBitApi::new()), None);
+        let torrents = vec![make_torrent("a", "h1")];
+        // Pass then ignore: final state should be ignored
+        let filters: Vec<Box<dyn TorrentFilter>> =
+            vec![Box::new(AlwaysPassFilter), Box::new(AlwaysIgnoreFilter)];
+        let result = ctrl.process_with_filters(torrents, filters).await.unwrap();
+        let data = result.values().next().unwrap();
+        assert!(data.ignored);
+        assert!(!data.messages.is_empty());
+    }
+
+    // ── CleanupController::new ────────────────────────────────────────────────
+
+    #[test]
+    fn cleanup_controller_new_with_qbit_succeeds() {
+        let qbit: Arc<dyn QBittorrentAPIInterface> = Arc::new(MockQBitApi::new());
+        let config = CleanupConfig {
+            ratio: None,
+            trackers: None,
+            categories: None,
+            dry_run: None,
+        };
+        assert!(CleanupController::new(config, Some(qbit), None, None).is_ok());
+    }
+
+    #[test]
+    fn cleanup_controller_new_without_qbit_fails() {
+        let config = CleanupConfig {
+            ratio: None,
+            trackers: None,
+            categories: None,
+            dry_run: None,
+        };
+        assert!(CleanupController::new(config, None, None, None).is_err());
+    }
+
+    // ── CleanupController::run ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_no_torrents_nothing_deleted() {
+        let mock = Arc::new(MockQBitApi::new());
+        let mut ctrl = make_run_controller(mock.clone(), None);
+        ctrl.run().await.unwrap();
+        assert!(mock.deleted_hashes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_torrents_with_no_filters_deletes_all() {
+        let mock = Arc::new(MockQBitApi::with_torrents(vec![
+            make_torrent("a", "hash1"),
+            make_torrent("b", "hash2"),
+        ]));
+        let mut ctrl = make_run_controller(mock.clone(), None);
+        ctrl.run().await.unwrap();
+        let deleted = mock.deleted_hashes();
+        assert!(deleted.contains(&"hash1".to_string()));
+        assert!(deleted.contains(&"hash2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_dry_run_deletes_nothing() {
+        let mock = Arc::new(MockQBitApi::with_torrents(vec![
+            make_torrent("a", "hash1"),
+            make_torrent("b", "hash2"),
+        ]));
+        let mut ctrl = make_run_controller(mock.clone(), Some(true));
+        ctrl.run().await.unwrap();
+        assert!(mock.deleted_hashes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sonarr_filter_keeps_queued_torrent() {
+        let sonarr_api: Arc<dyn SonarrAndRadarrAPIInterface> = Arc::new(MockArrApi::with_queue(
+            vec![make_queue_resource(Some("hash1"))],
+        ));
+        let mock = Arc::new(MockQBitApi::with_torrents(vec![
+            make_torrent("a", "hash1"), // in Sonarr queue → ignored
+            make_torrent("b", "hash2"), // not in queue → deleted
+        ]));
+        let mut ctrl = CleanupController {
+            cleanup_config: CleanupConfig {
+                ratio: None,
+                trackers: None,
+                categories: None,
+                dry_run: None,
+            },
+            qbittorrent: mock.clone(),
+            sonarr: Some(sonarr_api),
+            radarr: None,
+        };
+        ctrl.run().await.unwrap();
+        let deleted = mock.deleted_hashes();
+        assert!(!deleted.contains(&"hash1".to_string()));
+        assert!(deleted.contains(&"hash2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_delete_failure_propagates_error() {
+        let mock = Arc::new(MockQBitApi {
+            deleted: Arc::new(std::sync::Mutex::new(vec![])),
+            delete_result: false,
+            torrent_list: vec![make_torrent("a", "hash1")],
+        });
+        let mut ctrl = make_run_controller(mock, None);
+        assert!(ctrl.run().await.is_err());
+    }
+
+    // ── Task ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn task_execute_delegates_to_run() {
+        let mock = Arc::new(MockQBitApi::with_torrents(vec![make_torrent("a", "h1")]));
+        let mut ctrl = make_run_controller(mock.clone(), None);
+        ctrl.execute().await.unwrap();
+        assert!(mock.deleted_hashes().contains(&"h1".to_string()));
+    }
+
+    #[test]
+    fn task_name_is_cleanup() {
+        let ctrl = make_controller(Arc::new(MockQBitApi::new()), None);
+        assert_eq!(ctrl.name(), "cleanup");
     }
 }
