@@ -37,16 +37,19 @@ pub enum TrackedDownloadStatus {
     Error,
 }
 
+#[derive(Clone)]
 pub struct TrackedDownloadStatusMessage {
     #[allow(unused)]
     pub title: Option<String>,
     pub messages: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct SystemStatus {
     pub start_time: OffsetDateTime,
 }
 
+#[derive(Clone)]
 pub struct QueueResource {
     pub id: i32,
     pub added: Option<OffsetDateTime>,

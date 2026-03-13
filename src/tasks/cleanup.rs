@@ -1,9 +1,14 @@
 use std::{
-    collections::HashSet, fmt::Debug, os::linux::fs::MetadataExt, path::Path, sync::Arc,
-    time::Duration,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    ops::AddAssign,
+    os::linux::fs::MetadataExt,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use log::{debug, error, info, trace};
 use time::OffsetDateTime;
@@ -11,7 +16,10 @@ use tokio::fs;
 use url::Url;
 
 use crate::{
-    apis::{QBittorrentAPIInterface, SonarrAndRadarrAPIInterface},
+    apis::{
+        QBittorrentAPIInterface, SonarrAndRadarrAPIInterface,
+        types::{QueueResource, SystemStatus},
+    },
     config::{CategoriesConfig, CleanupConfig, TrackerConfig, TrackerIgnore},
     tasks::Task,
 };
@@ -53,10 +61,49 @@ impl std::hash::Hash for Torrent {
     }
 }
 
+struct TorrentFilterData {
+    ignored: bool,
+    messages: Vec<String>,
+}
+
+impl TorrentFilterData {
+    fn pass() -> Self {
+        Self {
+            ignored: false,
+            messages: Vec::new(),
+        }
+    }
+
+    fn ignored(messages: Vec<String>) -> Self {
+        if messages.is_empty() {
+            Self::pass()
+        } else {
+            Self {
+                ignored: true,
+                messages,
+            }
+        }
+    }
+
+    fn ignored_single_message(message: String) -> Self {
+        Self {
+            ignored: true,
+            messages: vec![message],
+        }
+    }
+}
+
+impl AddAssign for TorrentFilterData {
+    fn add_assign(&mut self, rhs: Self) {
+        self.ignored = self.ignored || rhs.ignored;
+        self.messages.extend(rhs.messages);
+    }
+}
+
 #[async_trait]
 trait TorrentFilter: Send {
     fn name(&self) -> String;
-    async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>>;
+    async fn filter(&mut self, torrent: &Torrent) -> Result<TorrentFilterData>;
 }
 
 impl Debug for dyn TorrentFilter {
@@ -81,27 +128,23 @@ impl TorrentFilter for CategoriesFilter {
         "CategoriesFilter".to_string()
     }
 
-    async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
+    async fn filter(&mut self, torrent: &Torrent) -> Result<TorrentFilterData> {
         let categories = match self.categories.as_ref() {
             Some(ignored_categories) => ignored_categories,
-            None => return Ok(torrents),
+            None => return Ok(TorrentFilterData::pass()),
         };
 
-        let mut result = vec![];
-        for torrent in torrents {
-            if categories
-                .iter()
-                .any(|category| category.ignore && category.name == torrent.category)
-            {
-                debug!(
-                    "Ignoring torrent '{}' due to category '{}'",
-                    torrent.name, torrent.category
-                );
-            } else {
-                result.push(torrent);
-            }
+        if categories
+            .iter()
+            .any(|category| category.ignore && category.name == torrent.category)
+        {
+            return Ok(TorrentFilterData::ignored_single_message(format!(
+                "Ignoring torrent '{}' due to category '{}'",
+                torrent.name, torrent.category
+            )));
+        } else {
+            return Ok(TorrentFilterData::pass());
         }
-        Ok(result)
     }
 }
 
@@ -125,195 +168,215 @@ impl TorrentFilter for TrackerFilter {
         "TrackerFilter".to_string()
     }
 
-    async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
+    async fn filter(&mut self, torrent: &Torrent) -> Result<TorrentFilterData> {
         let trackers = match self.trackers.as_ref() {
             Some(ignored_trackers) => ignored_trackers,
-            None => return Ok(torrents),
+            None => return Ok(TorrentFilterData::pass()),
         };
 
-        let mut result = vec![];
+        let mut ignored_reasons = vec![];
 
-        for torrent in torrents {
-            let torrent_tracker_urls = torrent
-                .trackers
-                .iter()
-                .filter_map(|t| Url::parse(&t.url).ok())
-                .collect::<Vec<_>>();
+        let torrent_tracker_urls: Vec<Url> = torrent
+            .trackers
+            .iter()
+            .filter_map(|t| Url::parse(&t.url).ok())
+            .collect();
 
-            let configured_trackers = trackers
-                .iter()
-                .filter(|tracker| {
-                    torrent_tracker_urls.iter().any(|url| {
-                        url.domain()
-                            .is_some_and(|v| tracker.domain.contains(&v.to_string()))
-                    })
+        let configured_trackers: Vec<&TrackerConfig> = trackers
+            .iter()
+            .filter(|tracker| {
+                torrent_tracker_urls.iter().any(|url| {
+                    url.domain()
+                        .is_some_and(|v| tracker.domain.contains(&v.to_string()))
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect();
 
-            let mut ignored = false;
-
-            if configured_trackers.is_empty()
-                && let Some(global_ratio) = self.global_ratio
-                && torrent.ratio < global_ratio
-            {
-                debug!(
+        if configured_trackers.is_empty()
+            && let Some(global_ratio) = self.global_ratio
+            && torrent.ratio < global_ratio
+        {
+            ignored_reasons.push(format!(
                     "Ignoring torrent '{}' due to ratio {:.2} not reaching minimum required global ratio {:.2}",
                     torrent.name, torrent.ratio, global_ratio
-                );
-                ignored = true;
-            }
+                ));
+        }
 
-            let percentage_multiple_linked =
-                if torrent.progress == 1.0 && !configured_trackers.is_empty() {
-                    let mut progress_size = 0;
-                    let mut total_size = 0;
-                    for content in &torrent.contents {
-                        let save_path = Path::new(&torrent.save_path).join(&content.name);
-                        let is_video = VIDEO_EXTENSIONS
-                            .iter()
-                            .any(|ext| save_path.extension().map_or(false, |e| e == *ext));
-                        if !is_video {
+        let percentage_multiple_linked =
+            if torrent.progress == 1.0 && !configured_trackers.is_empty() {
+                let mut progress_size = 0;
+                let mut total_size = 0;
+                for content in &torrent.contents {
+                    let save_path = Path::new(&torrent.save_path).join(&content.name);
+                    let is_video = VIDEO_EXTENSIONS
+                        .iter()
+                        .any(|ext| save_path.extension().map_or(false, |e| e == *ext));
+                    if !is_video {
+                        continue;
+                    }
+                    total_size += content.size;
+                    let metadata = match fs::metadata(&save_path).await {
+                        Ok(meta) => meta,
+                        Err(e) => {
+                            debug!(
+                                "Failed to get metadata for file '{}': {}",
+                                save_path.to_str().unwrap_or("unknown"),
+                                e
+                            );
                             continue;
                         }
-                        total_size += content.size;
-                        let metadata = match fs::metadata(&save_path).await {
-                            Ok(meta) => meta,
-                            Err(e) => {
-                                debug!(
-                                    "Failed to get metadata for file '{}': {}",
-                                    save_path.to_str().unwrap_or("unknown"),
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-                        let num_links = metadata.st_nlink();
-                        let disk_size = metadata.len();
+                    };
+                    let num_links = metadata.st_nlink();
+                    let disk_size = metadata.len();
 
-                        if num_links > 1 {
-                            progress_size += disk_size;
-                        }
+                    if num_links > 1 {
+                        progress_size += disk_size;
                     }
-
-                    let result = (progress_size as f64 / total_size as f64) * 100.0;
-                    trace!(
-                        "Torrent '{}' has {:.0}% multiple hard linked files",
-                        torrent.name, result
-                    );
-                    Some(result)
-                } else {
-                    None
-                };
-
-            for tracker in configured_trackers {
-                match tracker
-                    .ignore
-                    .as_ref()
-                    .unwrap_or(&TrackerIgnore::WhenHardLinked)
-                {
-                    TrackerIgnore::Always => {
-                        debug!(
-                            "Ignoring torrent '{}' due to tracker '{}' with ignore enabled",
-                            torrent.name, tracker.name
-                        );
-                        ignored = true;
-                        break;
-                    }
-                    TrackerIgnore::WhenHardLinked => {
-                        if let Some(percentage) = percentage_multiple_linked
-                            && percentage >= tracker.hard_links_percentage as f64
-                        {
-                            debug!(
-                                "Ignoring torrent '{}' due to tracker '{}' with {:.0}% multiple hard linked files",
-                                torrent.name, tracker.name, percentage
-                            );
-                            ignored = true;
-                            break;
-                        }
-                    }
-                    TrackerIgnore::Never => {}
                 }
 
-                let ratio_reached_opt = tracker.ratio.map(|ratio| torrent.ratio >= ratio);
+                let result = (progress_size as f64 / total_size as f64) * 100.0;
+                trace!(
+                    "Torrent '{}' has {:.0}% multiple hard linked files",
+                    torrent.name, result
+                );
+                Some(result)
+            } else {
+                None
+            };
 
-                let seeding_time_reached_opt = tracker
-                    .seeding_time
-                    .map(|seeding_time| torrent.seeding_time >= seeding_time);
-
-                if let Some(ratio_reached) = ratio_reached_opt
-                    && let Some(seeding_time_reached) = seeding_time_reached_opt
-                {
-                    if tracker.require_both && (!ratio_reached || !seeding_time_reached) {
-                        debug!(
-                            "Ignoring torrent '{}' due to ratio {:.2} or seeding time {} not reaching minimum required ratio {:.2} or time {} for tracker '{}'",
-                            torrent.name,
-                            torrent.ratio,
-                            humantime::format_duration(torrent.seeding_time),
-                            tracker.ratio.unwrap_or(0.0),
-                            humantime::format_duration(
-                                tracker.seeding_time.unwrap_or(Duration::from_secs(0))
-                            ),
-                            tracker.name
-                        );
-                        ignored = true;
-                        break;
-                    } else if !ratio_reached && !seeding_time_reached {
-                        debug!(
-                            "Ignoring torrent '{}' due to ratio {:.2} and seeding time {} not reaching minimum required ratio {:.2} and time {} for tracker '{}'",
-                            torrent.name,
-                            torrent.ratio,
-                            humantime::format_duration(torrent.seeding_time),
-                            tracker.ratio.unwrap_or(0.0),
-                            humantime::format_duration(
-                                tracker.seeding_time.unwrap_or(Duration::from_secs(0))
-                            ),
-                            tracker.name
-                        );
-                        ignored = true;
-                        break;
+        for tracker in configured_trackers {
+            match tracker
+                .ignore
+                .as_ref()
+                .unwrap_or(&TrackerIgnore::WhenHardLinked)
+            {
+                TrackerIgnore::Always => {
+                    ignored_reasons.push(format!(
+                        "Ignoring torrent '{}' due to tracker '{}' with ignore enabled",
+                        torrent.name, tracker.name
+                    ));
+                }
+                TrackerIgnore::WhenHardLinked => {
+                    if let Some(percentage) = percentage_multiple_linked
+                        && percentage >= tracker.hard_links_percentage as f64
+                    {
+                        ignored_reasons.push(format!(
+                                "Ignoring torrent '{}' due to tracker '{}' with {:.0}% multiple hard linked files",
+                                torrent.name, tracker.name, percentage
+                            ));
                     }
-                } else if ratio_reached_opt.is_some_and(|ratio_reached| !ratio_reached) {
-                    debug!(
-                        "Ignoring torrent '{}' due to ratio {:.2} not reaching minimum required ratio {:.2} for tracker '{}'",
+                }
+                TrackerIgnore::Never => {}
+            }
+
+            let ratio_reached_opt = tracker.ratio.map(|ratio| torrent.ratio >= ratio);
+
+            let seeding_time_reached_opt = tracker
+                .seeding_time
+                .map(|seeding_time| torrent.seeding_time >= seeding_time);
+
+            if let Some(ratio_reached) = ratio_reached_opt
+                && let Some(seeding_time_reached) = seeding_time_reached_opt
+            {
+                if tracker.require_both && (!ratio_reached || !seeding_time_reached) {
+                    ignored_reasons.push(format!(
+                        "Ignoring torrent '{}' due to ratio {:.2} or seeding time {} not reaching minimum required ratio {:.2} or time {} for tracker '{}'",
                         torrent.name,
                         torrent.ratio,
-                        tracker.ratio.unwrap_or(0.0),
-                        tracker.name
-                    );
-                    ignored = true;
-                    break;
-                } else if seeding_time_reached_opt
-                    .is_some_and(|seeding_time_reached| !seeding_time_reached)
-                {
-                    debug!(
-                        "Ignoring torrent '{}' due to seeding time {} not reaching minimum required time {} for tracker '{}'",
-                        torrent.name,
                         humantime::format_duration(torrent.seeding_time),
+                        tracker.ratio.unwrap_or(0.0),
                         humantime::format_duration(
                             tracker.seeding_time.unwrap_or(Duration::from_secs(0))
                         ),
                         tracker.name
-                    );
-                    ignored = true;
-                    break;
+                    ));
+                } else if !ratio_reached && !seeding_time_reached {
+                    ignored_reasons.push(format!(
+                        "Ignoring torrent '{}' due to ratio {:.2} and seeding time {} not reaching minimum required ratio {:.2} and time {} for tracker '{}'",
+                        torrent.name,
+                        torrent.ratio,
+                        humantime::format_duration(torrent.seeding_time),
+                        tracker.ratio.unwrap_or(0.0),
+                        humantime::format_duration(
+                            tracker.seeding_time.unwrap_or(Duration::from_secs(0))
+                        ),
+                        tracker.name
+                    ));
                 }
-            }
-
-            if !ignored {
-                result.push(torrent);
+            } else if ratio_reached_opt.is_some_and(|ratio_reached| !ratio_reached) {
+                ignored_reasons.push(format!(
+                    "Ignoring torrent '{}' due to ratio {:.2} not reaching minimum required ratio {:.2} for tracker '{}'",
+                    torrent.name,
+                    torrent.ratio,
+                    tracker.ratio.unwrap_or(0.0),
+                    tracker.name
+                ));
+            } else if seeding_time_reached_opt
+                .is_some_and(|seeding_time_reached| !seeding_time_reached)
+            {
+                ignored_reasons.push(format!(
+                    "Ignoring torrent '{}' due to seeding time {} not reaching minimum required time {} for tracker '{}'",
+                    torrent.name,
+                    humantime::format_duration(torrent.seeding_time),
+                    humantime::format_duration(
+                        tracker.seeding_time.unwrap_or(Duration::from_secs(0))
+                    ),
+                    tracker.name
+                ));
             }
         }
-        Ok(result)
+
+        Ok(TorrentFilterData::ignored(ignored_reasons))
     }
 }
 
 struct SonarrFilter {
     sonarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
+    cached_queue: Option<(Instant, Vec<QueueResource>)>,
+    cached_system_status: Option<(Instant, SystemStatus)>,
 }
 
 impl SonarrFilter {
     fn new(sonarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>) -> Self {
-        Self { sonarr }
+        Self {
+            sonarr,
+            cached_queue: None,
+            cached_system_status: None,
+        }
+    }
+
+    async fn get_queue(&mut self) -> Result<Vec<QueueResource>> {
+        if let Some((fetched_at, ref queue)) = self.cached_queue {
+            if fetched_at.elapsed() < Duration::from_secs(60) {
+                return Ok(queue.clone());
+            }
+        }
+        let queue = match &self.sonarr {
+            Some(api) => api
+                .get_queue()
+                .await
+                .context("Could not retrieve Sonarr queue")?,
+            None => bail!("No Sonarr API available"),
+        };
+        self.cached_queue = Some((Instant::now(), queue.clone()));
+        Ok(queue)
+    }
+
+    async fn get_system_status(&mut self) -> Result<SystemStatus> {
+        if let Some((fetched_at, ref status)) = self.cached_system_status {
+            if fetched_at.elapsed() < Duration::from_secs(60) {
+                return Ok(status.clone());
+            }
+        }
+        let status = match &self.sonarr {
+            Some(api) => api
+                .get_system_status()
+                .await
+                .context("Could not retrieve Sonarr system status")?,
+            None => bail!("No Sonarr API available"),
+        };
+        self.cached_system_status = Some((Instant::now(), status.clone()));
+        Ok(status)
     }
 }
 
@@ -323,25 +386,21 @@ impl TorrentFilter for SonarrFilter {
         "SonarrFilter".to_string()
     }
 
-    async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
-        let api = match &self.sonarr {
-            Some(api) => api,
-            None => return Ok(torrents),
-        };
+    async fn filter(&mut self, torrent: &Torrent) -> Result<TorrentFilterData> {
+        if self.sonarr.is_none() {
+            return Ok(TorrentFilterData::pass());
+        }
 
-        let queue_items = api
-            .get_queue()
-            .await
-            .context("Could not retrieve Sonarr queue")?;
-        trace!("Sonarr Queue: {}", queue_items.len());
+        let queue_items = self.get_queue().await?;
+        // trace!("Sonarr Queue: {}", queue_items.len());
 
         // Ignore cleanup if Sonarr has started recently
         if queue_items.is_empty() {
-            let system_status = api.get_system_status().await?;
+            let system_status = self.get_system_status().await?;
             let mins = 2;
             if OffsetDateTime::now_utc() < system_status.start_time + Duration::from_secs(60 * mins)
             {
-                return Ok(Vec::new());
+                bail!("Skipping due to recent Sonarr startup");
             }
         }
 
@@ -351,35 +410,70 @@ impl TorrentFilter for SonarrFilter {
             .map(|id| id.to_lowercase())
             .collect::<HashSet<String>>();
 
-        trace!(
-            "Sonarr Torrents: {:?}",
-            torrents.iter().map(|t| &t.name).collect::<Vec<&String>>()
-        );
-        trace!("Sonarr Download Ids: {:?}", queue_download_ids);
+        // trace!(
+        //     "Sonarr Torrents: {:?}",
+        //     torrents.iter().map(|t| &t.name).collect::<Vec<&String>>()
+        // );
+        // trace!("Sonarr Download Ids: {:?}", queue_download_ids);
 
-        let mut torrents = torrents;
-        torrents.retain(|torrent| {
-            let in_queue = queue_download_ids.contains(&torrent.hash.to_lowercase());
-            if in_queue {
-                debug!(
-                    "Ignoring torrent '{}' due to still present on Sonarr queue",
-                    torrent.name,
-                );
-            }
-            !in_queue
-        });
+        if queue_download_ids.contains(&torrent.hash.to_lowercase()) {
+            return Ok(TorrentFilterData::ignored_single_message(format!(
+                "Ignoring torrent '{}' due to still present on Sonarr queue",
+                torrent.name,
+            )));
+        }
 
-        Ok(torrents)
+        Ok(TorrentFilterData::pass())
     }
 }
 
 struct RadarrFilter {
     radarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>,
+    cached_queue: Option<(Instant, Vec<QueueResource>)>,
+    cached_system_status: Option<(Instant, SystemStatus)>,
 }
 
 impl RadarrFilter {
     fn new(radarr: Option<Arc<dyn SonarrAndRadarrAPIInterface>>) -> Self {
-        Self { radarr }
+        Self {
+            radarr,
+            cached_queue: None,
+            cached_system_status: None,
+        }
+    }
+
+    async fn get_queue(&mut self) -> Result<Vec<QueueResource>> {
+        if let Some((fetched_at, ref queue)) = self.cached_queue {
+            if fetched_at.elapsed() < Duration::from_secs(60) {
+                return Ok(queue.clone());
+            }
+        }
+        let queue = match &self.radarr {
+            Some(api) => api
+                .get_queue()
+                .await
+                .context("Could not retrieve Radarr queue")?,
+            None => bail!("No Radarr API available"),
+        };
+        self.cached_queue = Some((Instant::now(), queue.clone()));
+        Ok(queue)
+    }
+
+    async fn get_system_status(&mut self) -> Result<SystemStatus> {
+        if let Some((fetched_at, ref status)) = self.cached_system_status {
+            if fetched_at.elapsed() < Duration::from_secs(60) {
+                return Ok(status.clone());
+            }
+        }
+        let status = match &self.radarr {
+            Some(api) => api
+                .get_system_status()
+                .await
+                .context("Could not retrieve Radarr system status")?,
+            None => bail!("No Radarr API available"),
+        };
+        self.cached_system_status = Some((Instant::now(), status.clone()));
+        Ok(status)
     }
 }
 
@@ -389,25 +483,20 @@ impl TorrentFilter for RadarrFilter {
         "RadarrFilter".to_string()
     }
 
-    async fn filter(&mut self, torrents: Vec<Torrent>) -> Result<Vec<Torrent>> {
-        let api = match &self.radarr {
-            Some(api) => api,
-            None => return Ok(torrents),
-        };
+    async fn filter(&mut self, torrent: &Torrent) -> Result<TorrentFilterData> {
+        if self.radarr.is_none() {
+            return Ok(TorrentFilterData::pass());
+        }
 
-        let queue_items = api
-            .get_queue()
-            .await
-            .context("Could not retrieve Radarr queue")?;
-        trace!("Radarr Queue: {}", queue_items.len());
+        let queue_items = self.get_queue().await?;
 
         // Ignore cleanup if Radarr has started recently
         if queue_items.is_empty() {
-            let system_status = api.get_system_status().await?;
+            let system_status = self.get_system_status().await?;
             let mins = 2;
             if OffsetDateTime::now_utc() < system_status.start_time + Duration::from_secs(60 * mins)
             {
-                return Ok(Vec::new());
+                bail!("Skipping due to recent Radarr startup");
             }
         }
 
@@ -417,19 +506,14 @@ impl TorrentFilter for RadarrFilter {
             .map(|id| id.to_lowercase())
             .collect::<HashSet<String>>();
 
-        let mut torrents = torrents;
-        torrents.retain(|torrent| {
-            let in_queue = queue_download_ids.contains(&torrent.hash.to_lowercase());
-            if in_queue {
-                debug!(
-                    "Ignoring torrent '{}' due to still present on Radarr queue",
-                    torrent.name,
-                );
-            }
-            !in_queue
-        });
+        if queue_download_ids.contains(&torrent.hash.to_lowercase()) {
+            return Ok(TorrentFilterData::ignored_single_message(format!(
+                "Ignoring torrent '{}' due to still present on Radarr queue",
+                torrent.name,
+            )));
+        }
 
-        Ok(torrents)
+        Ok(TorrentFilterData::pass())
     }
 }
 
@@ -514,7 +598,7 @@ impl CleanupController {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let mut torrents = get_torrents(self.qbittorrent.clone()).await?;
+        let torrents = get_torrents(self.qbittorrent.clone()).await?;
 
         let mut filters: Vec<Box<dyn TorrentFilter>> = Vec::new();
         filters.push(Box::new(CategoriesFilter::new(
@@ -527,25 +611,50 @@ impl CleanupController {
         filters.push(Box::new(SonarrFilter::new(self.sonarr.clone())));
         filters.push(Box::new(RadarrFilter::new(self.radarr.clone())));
 
-        for mut filter in filters {
-            debug!("Applying {filter:?} ");
-            torrents = filter.filter(torrents).await?;
-            debug!("Torrents after {filter:?}: {}", torrents.len());
+        let mut processed_torrents = HashMap::new();
+        let mut torrents_to_delete = HashMap::new();
+        let mut torrents_ignored = HashMap::new();
+        for filter in &mut filters {
+            debug!("Applying filter {}", filter.name());
+            for torrent in &torrents {
+                debug!("Evaluating torrent '{}'", torrent.name);
+                let torrent_entry = processed_torrents
+                    .entry(torrent)
+                    .or_insert_with(TorrentFilterData::pass);
+                if let Ok(data) = filter.filter(&torrent).await {
+                    *torrent_entry += data;
+                } else {
+                    error!(
+                        "Filter '{}' failed for torrent '{}', ignoring filter result: {}",
+                        filter.name(),
+                        torrent.name,
+                        anyhow!("Filter error").to_string()
+                    );
+                }
+            }
         }
 
-        if torrents.is_empty() {
+        for (torrent, filter_data) in processed_torrents {
+            if filter_data.ignored {
+                torrents_ignored.insert(torrent, filter_data.messages);
+            } else {
+                torrents_to_delete.insert(torrent, filter_data.messages);
+            }
+        }
+
+        if torrents_to_delete.is_empty() {
             trace!("No torrents to delete");
             return Ok(());
         }
 
         info!("The following torrents will be deleted:");
-        for torrent in &torrents {
+        for (torrent, _) in &torrents_to_delete {
             info!("- {}", torrent.name);
         }
 
-        let torrent_hashes = torrents
+        let torrent_hashes = torrents_to_delete
             .iter()
-            .map(|t| t.hash.clone())
+            .map(|(torrent, _)| torrent.hash.clone())
             .collect::<Vec<String>>();
 
         if self.cleanup_config.dry_run.unwrap_or(false) {

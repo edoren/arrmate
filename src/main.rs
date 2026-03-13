@@ -81,6 +81,9 @@ async fn run() -> Result<()> {
 
         tokio::select! {
             _ = interval.tick() => {
+                if config_changed {
+                    continue;
+                }
                 run_controllers = true;
            },
 
@@ -107,9 +110,15 @@ async fn run() -> Result<()> {
         }
 
         if config_changed {
-            let config: ConfigData = get_config()
-                .await
-                .map_err(|e| anyhow!("Failed to reload config: {e}"))?;
+            tasks.clear();
+
+            let config: ConfigData = match get_config().await {
+                Ok(config) => config,
+                Err(e) => {
+                    error!("Failed to load config: {e}");
+                    continue;
+                }
+            };
 
             qbittorrent_api = config.qbittorrent.map(|config| {
                 Arc::new(QBittorrentAPI::new(&config)) as Arc<dyn QBittorrentAPIInterface>
