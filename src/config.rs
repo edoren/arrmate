@@ -1,5 +1,6 @@
 use std::{str::FromStr, time::Duration};
 
+use chrono::TimeZone;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
@@ -9,14 +10,19 @@ pub struct Schedule(String);
 impl Schedule {
     pub fn next_date(&self, from: time::OffsetDateTime) -> Option<time::OffsetDateTime> {
         let schedule = croner::Cron::from_str(&self.0).ok();
-        let from_chrono = chrono::DateTime::from_timestamp(from.unix_timestamp(), 0);
+        let from_chrono = chrono::Local
+            .timestamp_opt(from.unix_timestamp(), 0)
+            .single();
         schedule
             .zip(from_chrono)
             .and_then(|(schedule, from_chrono)| {
                 schedule.find_next_occurrence(&from_chrono, false).ok()
             })
-            .and_then(|next_chrono| {
-                time::OffsetDateTime::from_unix_timestamp(next_chrono.timestamp()).ok()
+            .and_then(|next_chrono: chrono::DateTime<chrono::Local>| {
+                let offset_secs = next_chrono.offset().local_minus_utc();
+                let offset = time::UtcOffset::from_whole_seconds(offset_secs.into());
+                let dt = time::OffsetDateTime::from_unix_timestamp(next_chrono.timestamp()).ok();
+                offset.ok().zip(dt).map(|(offset, dt)| dt.to_offset(offset))
             })
     }
 }
