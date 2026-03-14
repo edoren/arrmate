@@ -256,14 +256,15 @@ impl Task for RetryController {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use time::OffsetDateTime;
+
     use super::*;
     use crate::apis::types::{
         QueueStatus, SystemStatus, TrackedDownloadState, TrackedDownloadStatus,
         TrackedDownloadStatusMessage,
     };
-    use anyhow::Result;
-    use async_trait::async_trait;
-    use time::OffsetDateTime;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

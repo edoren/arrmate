@@ -583,7 +583,6 @@ impl CleanupController {
 
         info!("Deleted {} torrents", deleted_count);
 
-
         Ok(())
     }
 }
@@ -605,12 +604,13 @@ impl Task for CleanupController {
 
 #[cfg(test)]
 mod tests {
+    use qbit_rs::model::{Tracker, TrackerStatus};
+    use time::OffsetDateTime;
+
     use super::*;
     use crate::apis::types::{
         QueueResource, QueueStatus, SystemStatus, TrackedDownloadState, TrackedDownloadStatus,
     };
-    use qbit_rs::model::{Tracker, TrackerStatus};
-    use time::OffsetDateTime;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

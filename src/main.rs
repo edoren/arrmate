@@ -1,7 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use cached::proc_macro::cached;
 use log::{error, info, trace, warn};
 use notify::{
     EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -9,7 +8,7 @@ use notify::{
 };
 use tasks::{Task, cleanup::CleanupController, retry::RetryController};
 use thiserror::Error;
-use time::{UtcOffset, format_description::well_known::Rfc3339};
+use time::UtcOffset;
 use tokio::fs;
 
 mod apis;
@@ -38,7 +37,6 @@ enum MainError {
     CurrentWorkingDirectoryNotFound,
 }
 
-#[cached(result = true)]
 async fn get_config_file() -> Result<PathBuf, MainError> {
     let current_dir =
         std::env::current_dir().map_err(|_| MainError::CurrentWorkingDirectoryNotFound)?;
@@ -60,7 +58,6 @@ async fn get_config_file() -> Result<PathBuf, MainError> {
     return Ok(config_path);
 }
 
-#[cached(result = true)]
 async fn get_config() -> Result<ConfigData, MainError> {
     Ok(serde_yaml::from_str(
         fs::read_to_string(get_config_file().await?)
@@ -166,8 +163,6 @@ impl ArrMate {
                     Ok(offset) => next.to_offset(offset),
                     Err(_) => next,
                 }
-                .format(&Rfc3339)
-                .unwrap_or_default()
             );
         } else {
             info!(
@@ -183,7 +178,6 @@ impl ArrMate {
                 self.config = Some(config);
                 self.tasks = self.create_tasks().await;
                 info!("Config loaded successfully");
-                self.last_execution_time = time::OffsetDateTime::now_utc();
                 for task in &self.tasks {
                     self.report_task_next_time(task);
                 }
@@ -246,6 +240,9 @@ impl ArrMate {
                             && path == &config_path
                         {
                             info!("Config file changed, reloading...");
+                            self.config = None;
+                            self.tasks.clear();
+                            self.last_execution_time = time::OffsetDateTime::now_utc();
                             self.reload_config().await;
                         }
                     }
@@ -344,9 +341,10 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use config::{CleanupConfig, QBittorrentConfig, RadarrConfig, RetryConfig, SonarrConfig};
     use url::Url;
+
+    use super::*;
 
     fn test_schedule() -> config::Schedule {
         "0 * * * * * *".parse().unwrap()
