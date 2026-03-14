@@ -576,12 +576,13 @@ impl CleanupController {
             .await
             .map_err(|e| anyhow!("Failed to delete torrents: {}", e))?;
 
-        info!("Deleted {} torrents", deleted_count);
-
-        info!("The following torrents were deleted:");
+        info!("The following torrents are going to be deleted:");
         for torrent in &torrents_to_delete {
             info!("- {}", torrent.name);
         }
+
+        info!("Deleted {} torrents", deleted_count);
+
 
         Ok(())
     }
@@ -595,6 +596,10 @@ impl Task for CleanupController {
 
     async fn execute(&mut self) -> Result<()> {
         self.run().await
+    }
+
+    fn next_date(&self, from: time::OffsetDateTime) -> Option<time::OffsetDateTime> {
+        self.cleanup_config.schedule.next_date(from)
     }
 }
 
@@ -684,6 +689,7 @@ mod tests {
     ) -> CleanupController {
         CleanupController {
             cleanup_config: CleanupConfig {
+                schedule: "0 * * * *".parse().unwrap(),
                 ratio: None,
                 trackers: None,
                 categories: None,
@@ -698,6 +704,7 @@ mod tests {
     fn make_run_controller(mock: Arc<MockQBitApi>, dry_run: Option<bool>) -> CleanupController {
         CleanupController {
             cleanup_config: CleanupConfig {
+                schedule: "0 * * * *".parse().unwrap(),
                 ratio: None,
                 trackers: None,
                 categories: None,
@@ -1572,6 +1579,7 @@ mod tests {
     fn cleanup_controller_new_with_qbit_succeeds() {
         let qbit: Arc<dyn QBittorrentAPIInterface> = Arc::new(MockQBitApi::new());
         let config = CleanupConfig {
+            schedule: "0 * * * *".parse().unwrap(),
             ratio: None,
             trackers: None,
             categories: None,
@@ -1583,6 +1591,7 @@ mod tests {
     #[test]
     fn cleanup_controller_new_without_qbit_fails() {
         let config = CleanupConfig {
+            schedule: "0 * * * *".parse().unwrap(),
             ratio: None,
             trackers: None,
             categories: None,
@@ -1636,6 +1645,7 @@ mod tests {
         ]));
         let mut ctrl = CleanupController {
             cleanup_config: CleanupConfig {
+                schedule: "0 * * * *".parse().unwrap(),
                 ratio: None,
                 trackers: None,
                 categories: None,
